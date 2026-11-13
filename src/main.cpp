@@ -12,6 +12,7 @@
 #include <QCoreApplication>
 #include <QDBusConnection>
 #include <QDateTime>
+#include <QSet>
 #include <QTextStream>
 #include <QTimer>
 
@@ -58,11 +59,21 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // one write is often several events: --print shows each folder at most once a second
+    qint64 printedSecond = 0;
+    QSet<QString> printed;
     QObject::connect(&watcher, &FanotifyWatcher::changed, &app, [&](const QString &folder, const QString &name) {
         const qint64 now = QDateTime::currentSecsSinceEpoch();
-        tree.touch(folder, now);
-        if (print) {
-            out << QDateTime::fromSecsSinceEpoch(now).toString(Qt::ISODate) << "  " << folder << "  " << name << Qt::endl;
+        const bool kept = tree.touch(folder, now);
+        if (print && kept) {
+            if (now != printedSecond) {
+                printedSecond = now;
+                printed.clear();
+            }
+            if (!printed.contains(folder)) {
+                printed.insert(folder);
+                out << QDateTime::fromSecsSinceEpoch(now).toString(Qt::ISODate) << "  " << folder << "  " << name << Qt::endl;
+            }
         }
     });
     QObject::connect(&watcher, &FanotifyWatcher::overflowed, &app, [&] {

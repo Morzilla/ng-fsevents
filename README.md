@@ -32,7 +32,8 @@ So the listening has to happen in a small privileged service that runs all the t
 1. At start, it finds the users' homes (accounts from `UID_MIN` up) and puts one fanotify mark on each
    filesystem that holds one.
 2. For each change (modified, attributes, created, deleted, moved) it turns the folder's file handle back into
-   a path. A change outside every home is dropped at once and never kept.
+   a path. A change outside every home is dropped at once and never kept, and so is one inside a hidden folder
+   (caches, settings, containers): like a file manager, which does not show them. `.git` still counts.
 3. It records the time on that folder and on every folder above it, up to the home.
 4. The table is saved in its state directory every minute and when it stops, so it survives restarts.
 5. Applications ask over D-Bus.

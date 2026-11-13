@@ -24,8 +24,9 @@ public:
 
     explicit NewestTree(const QList<Home> &homes);
 
-    /** Something changed in @p folder at @p when (seconds since the epoch). */
-    void touch(const QString &folder, qint64 when);
+    /** Something changed in @p folder at @p when (seconds since the epoch). Returns false when it was not kept:
+     *  outside every home, or inside a hidden folder (like a file manager, which hides them; .git still counts). */
+    bool touch(const QString &folder, qint64 when);
     /** Everything is to be considered changed (the kernel queue overflowed). */
     void touchAll(qint64 when);
 

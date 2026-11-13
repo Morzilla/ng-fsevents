@@ -78,11 +78,18 @@ QString NewestTree::homeOf(uint uid) const
     return {};
 }
 
-void NewestTree::touch(const QString &folder, qint64 when)
+bool NewestTree::touch(const QString &folder, qint64 when)
 {
     const Home *home = homeFor(folder);
     if (!home) {
-        return; // not in a user's home: not kept
+        return false; // not in a user's home: not kept
+    }
+    // inside a hidden folder (caches, settings, containers...): what a file manager does not show does not count
+    const QStringView inside = QStringView(folder).mid(home->path.size());
+    for (const QStringView part : inside.split(QLatin1Char('/'), Qt::SkipEmptyParts)) {
+        if (part.startsWith(QLatin1Char('.')) && part != QLatin1String(".git")) {
+            return false;
+        }
     }
     QString current = folder;
     for (;;) {
@@ -100,6 +107,7 @@ void NewestTree::touch(const QString &folder, qint64 when)
             break;
         }
     }
+    return true;
 }
 
 void NewestTree::touchAll(qint64 when)
