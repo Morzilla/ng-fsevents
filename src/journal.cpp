@@ -207,7 +207,9 @@ void EventJournal::put(const QString &path, quint32 kinds, int pid, qint64 when)
     entry.kinds = (sameBurst ? (entry.kinds & (FileEvent::Created | FileEvent::Moved)) : 0) | kinds;
     entry.when = when;
     entry.count = 0;
-    if (!by.program.isEmpty() || !sameBurst) {
+    // (within those moments the one who made it stays: a program that touches it right after did not make it)
+    const bool madeBefore = sameBurst && (entry.kinds & FileEvent::Created) && !(kinds & FileEvent::Created) && !entry.program.isEmpty();
+    if (!madeBefore && (!by.program.isEmpty() || !sameBurst)) {
         entry.program = by.program;
         entry.app = by.app;
     }
