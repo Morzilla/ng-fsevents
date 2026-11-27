@@ -13,6 +13,27 @@ again when the folder is shown. That works, but it is not real time and it goes 
 A KDE developer suggested the proper way: fanotify, in a root service, as a library other applications can
 use. This is a sketch of that.
 
+![What it is for: a list of recent files that says which program did what (ng-recent, in Dolphin NG)](docs/recent-list.png)
+
+Two things come out of it:
+
+- **when something last changed under each folder**, for file managers that sort folders by date;
+- **the latest thing that happened to each file, and which program did it**, for lists of recent files:
+  [ng-recent](https://github.com/Morzilla/ng-recent) uses it, and through it Dolphin NG and
+  [Dialog NG](https://github.com/Morzilla/dialog-ng) (the picture above).
+
+What it sees, as `ng-fseventsd --print` shows it (a folder made, a file written by a shell, a document saved by
+an editor, a download finished by a browser, a build of 120 files):
+
+```
+2026-11-27T17:33:02  /home/ada/Documents  Aurora
+    file: /home/ada/Documents/Aurora  [created,folder]  by mkdir
+    file: /home/ada/Documents/Aurora/notes.txt  [created,modified]  by bash
+    file: /home/ada/Documents/Aurora/report.odt  [modified]  by kwrite (org.kde.kwrite)
+    file: /home/ada/Downloads/manual.pdf  [created,modified]  by firefox (firefox_firefox)
+    file: /home/ada/Projects/app/src  [modified,folder,bulk:120]  by python3
+```
+
 ## Why a service, and why root
 
 Linux has two APIs for file changes, and neither does this on its own:
