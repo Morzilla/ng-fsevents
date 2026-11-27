@@ -67,6 +67,8 @@ public:
     /** How many exclusions @p uid's home has. */
     int exclusions(uint uid) const;
 
+    /** The real path of the home @p real is in, or an empty string. */
+    QString homeRootOf(const QString &real) const;
     /** The real path of @p uid's home, or an empty string. */
     QString realHomeOf(uint uid) const;
     /** When events were last lost (0: never). */

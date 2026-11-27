@@ -75,8 +75,11 @@ Left out, because nobody looks for them among recent files:
 
 - what is hidden or inside a hidden folder, and temporary, lock and partial-download files;
 - a file opened for writing and closed unwritten, and changes of attributes only (tags, permissions, dates);
-- a program that changes more than 40 files in a row (a build, an archive unpacked, a synchronisation, a
-  checkout): one entry for the folder they have in common, with their number.
+- what is built from something else: object and bytecode files (`.o`, `.pyc`, `.class`...), and what is inside
+  the folders build systems fill (`build`, `build-*`, `CMakeFiles`, `node_modules`, `__pycache__`...);
+- more than 40 files changed in a row (a build, an archive unpacked, a synchronisation, a checkout): one entry
+  for the folder they have in common, with their number. Counted by application; the programs that belong to
+  none (compilers, shells, tools) are counted together, since a build is hundreds of short processes.
 
 ### Leaving things out
 

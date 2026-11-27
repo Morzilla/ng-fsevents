@@ -287,6 +287,12 @@ QStringList NewestTree::changedSince(uint uid, qint64 since, int limit) const
     return folders;
 }
 
+QString NewestTree::homeRootOf(const QString &real) const
+{
+    const Home *home = homeFor(real);
+    return home ? home->real : QString();
+}
+
 QString NewestTree::realHomeOf(uint uid) const
 {
     const Home *home = homeOf(uid);

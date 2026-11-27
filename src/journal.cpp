@@ -96,6 +96,7 @@ bool EventJournal::isNoise(const QString &name)
         return true; // Emacs
     }
     static const QRegularExpression temporary(QStringLiteral("\\.(?:tmp|temp|part|partial|crdownload|download|swp|swx|lock|lck|bak|kate-swp)$|" // by extension
+                                                             "\\.(?:o|obj|d|lo|gch|pch|pyc|pyo|class)$|" // built from something else
                                                              "\\.(?:tmp|temp)[.-]?[0-9A-Za-z]{2,}$|" // name.tmp123, name.tmp.Ab12Cd
                                                              "-(?:journal|wal|shm)$|" // SQLite
                                                              "^~\\$|^lu[0-9a-z]+\\.tmp$|^sed[A-Za-z0-9]{6}$"), // Office, LibreOffice, sed -i
@@ -110,7 +111,13 @@ bool EventJournal::isNoise(const QString &name)
 
 bool EventJournal::wanted(const QString &folder, const QString &name) const
 {
-    return !isNoise(name) && m_tree->shown(folder) && !m_tree->excludedName(folder, name);
+    if (isNoise(name) || !m_tree->shown(folder) || m_tree->excludedName(folder, name)) {
+        return false;
+    }
+    // the folders build systems fill, at any depth
+    static const QRegularExpression built(QStringLiteral("/(?:build|_build|build-[^/]*|cmake-build-[^/]*|CMakeFiles|[^/]*_autogen|node_modules|__pycache__)(?:/|$)"));
+    const QString home = m_tree->homeRootOf(folder);
+    return !built.match(QStringView(folder).mid(home.size()).toString() + QLatin1Char('/') + name).hasMatch();
 }
 
 EventJournal::Who EventJournal::who(int pid, qint64 when)
@@ -129,16 +136,23 @@ EventJournal::Who EventJournal::who(int pid, qint64 when)
     return *it;
 }
 
+QString EventJournal::burstKey(const Who &by, const QString &path) const
+{
+    // an application, whatever its processes; what belongs to none (compilers, shells, tools) together, by home
+    return (by.app.isEmpty() ? QStringLiteral("tools:") : QStringLiteral("app:") + by.app + QLatin1Char(':')) + m_tree->homeRootOf(path);
+}
+
 void EventJournal::put(const QString &path, quint32 kinds, int pid, qint64 when)
 {
     const Who by = who(pid, when);
 
-    // many files by one process in a short time: one entry for the folder they share, not one each
-    if (pid > 0 && !(kinds & FileEvent::Folder)) {
+    // many files in a short time: one entry for the folder they share, not one each
+    const QString key = burstKey(by, path);
+    if (!(kinds & FileEvent::Folder)) {
         if (m_bursts.size() > 1024) {
             m_bursts.clear();
         }
-        Burst &burst = m_bursts[pid];
+        Burst &burst = m_bursts[key];
         if (when - burst.last > s_bulkWindowMs) {
             burst = Burst{};
             burst.started = when;
@@ -173,7 +187,8 @@ void EventJournal::put(const QString &path, quint32 kinds, int pid, qint64 when)
             }
         }
         if (burst.bulk) {
-            if (m_tree->shown(burst.common)) {
+            // (things all over the home at once have nothing in common: no entry for the home itself)
+            if (m_tree->shown(burst.common) && burst.common != m_tree->homeRootOf(burst.common)) {
                 burst.count = qMax<quint32>(burst.count, burst.counted.size());
                 if (!m_entries.contains(burst.common)) {
                     // the folders the same burst made inside it are part of the one entry
@@ -195,8 +210,8 @@ void EventJournal::put(const QString &path, quint32 kinds, int pid, qint64 when)
         }
     }
 
-    if ((kinds & FileEvent::Folder) && pid > 0) {
-        const auto burst = m_bursts.constFind(pid);
+    if (kinds & FileEvent::Folder) {
+        const auto burst = m_bursts.constFind(key);
         if (burst != m_bursts.cend() && burst->bulk && when - burst->last <= s_bulkWindowMs && path.startsWith(burst->common + QLatin1Char('/'))) {
             return; // a folder made by a bulk change inside the folder that stands for it
         }

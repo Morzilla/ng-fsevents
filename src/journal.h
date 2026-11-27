@@ -32,8 +32,10 @@ struct FileEvent {
  *
  * Left out, because nobody would look for them in a list of recent files:
  *  - what is hidden or lies inside a hidden folder, and the temporary and lock files of the programs;
- *  - a program that changes many files in a short time (a build, an archive unpacked, a synchronisation, a
- *    checkout): its files are taken back and one entry is kept for the folder they have in common.
+ *  - what is built from something else: object and bytecode files, the folders of build systems;
+ *  - many files changed in a short time (a build, an archive unpacked, a synchronisation, a checkout): they are
+ *    taken back and one entry is kept for the folder they have in common. Counted by application; the programs
+ *    that belong to none (compilers, shells, tools: a build is hundreds of processes) are counted together.
  */
 class EventJournal
 {
@@ -95,11 +97,12 @@ private:
     bool wanted(const QString &folder, const QString &name) const;
     Who who(int pid, qint64 when);
     void put(const QString &path, quint32 kinds, int pid, qint64 when);
+    QString burstKey(const Who &by, const QString &path) const;
 
     const NewestTree *m_tree;
     QHash<QString, Entry> m_entries; // real path -> the latest that happened to it
     QHash<int, Who> m_who;
-    QHash<int, Burst> m_bursts;
+    QHash<QString, Burst> m_bursts; // by who is changing: an application, or all the tools at work in a home
     QHash<QString, Temp> m_temps; // temporary files being written: real path -> what is known of them
     mutable bool m_dirty = false;
 };
