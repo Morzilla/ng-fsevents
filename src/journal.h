@@ -16,6 +16,8 @@ struct FileEvent {
         Modified = 2, // written to, or saved over (a program that writes a temporary file and renames it)
         Moved = 4, // renamed or moved to where it is now
         Folder = 8, // it is a folder
+        Automatic = 32, // done by something that works on its own (a synchronisation, an updater, a timer, the
+                        // desktop's own services), not by an application or a terminal the user was at
     };
     QString path;
     qint64 when = 0; // milliseconds since the epoch
@@ -98,6 +100,7 @@ private:
     struct Who {
         QString program;
         QString app;
+        QString service; // the systemd service it runs in when it works on its own, or empty
         qint64 asked = 0;
     };
     struct Operation {

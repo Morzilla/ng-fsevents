@@ -87,7 +87,13 @@ of the homes, and which program did it: what a list of recent files needs to say
 "downloaded with Firefox" for files no file manager touched. One entry per path, for 14 days, at most 20 000.
 
 `kinds` is a sum of: 1 created, 2 modified (written to, or saved over), 4 renamed or moved to where it is,
-8 it is a folder.
+8 it is a folder, 32 done by something that works on its own.
+
+**By hand or on its own.** A change is "automatic" (32) when the process that made it runs in a systemd service,
+of the system or of the user: a synchronisation, an updater, a timer. An application or a terminal runs in a
+scope (the session's, or one of its own), and so does what is started from them. The desktop's own background
+programs (plasmashell, kded, the file indexer...) share the session with the applications and are known by
+name. Each service has its own operations, apart from what the user does at the same moment.
 
 `operation` ties together the files changed in one go: by one application (or by the tools at work in the home:
 a build is hundreds of short processes), one after the other, each within 10 seconds of the one before. An

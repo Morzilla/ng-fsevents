@@ -266,6 +266,7 @@ int main(int argc, char **argv)
                 kinds += (it->kinds & FileEvent::Modified) ? QStringLiteral("modified") : QString();
                 kinds += (it->kinds & FileEvent::Moved) ? QStringLiteral("moved") : QString();
                 kinds += (it->kinds & FileEvent::Folder) ? QStringLiteral("folder") : QString();
+                kinds += (it->kinds & FileEvent::Automatic) ? QStringLiteral("automatic") : QString();
                 kinds.removeAll(QString());
                 out << "    file: " << it->path << "  [" << kinds.join(QLatin1Char(',')) << "]  by " << (it->program.isEmpty() ? QStringLiteral("?") : it->program)
                     << (it->app.isEmpty() ? QString() : QStringLiteral(" (") + it->app + QLatin1Char(')')) << "  #" << it->operation << Qt::endl;

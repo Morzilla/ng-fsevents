@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSet>
 
 #include <algorithm>
 
@@ -104,6 +105,31 @@ QString appOf(int pid)
     match = snap.match(unit);
     return match.hasMatch() ? match.captured(1).left(128) : QString();
 }
+
+// What works on its own: the systemd service a process runs in, of the system or of the user (a synchronisation,
+// an updater, a timer), unless that service is an application the desktop started ("app-..."; the ones started
+// with the session, "@autostart", are on their own too). An application or a terminal is in a scope: the user's
+// session, or a scope of its own. The desktop's own background programs live in the session with everything
+// else: those are known by name.
+QString serviceOf(int pid, const QString &program)
+{
+    static const QSet<QString> desktopOwn{QStringLiteral("plasmashell"),       QStringLiteral("kded6"),          QStringLiteral("kded5"),       QStringLiteral("kwin_wayland"),
+                                          QStringLiteral("kwin_x11"),          QStringLiteral("baloo_file"),     QStringLiteral("baloorunner"), QStringLiteral("ksmserver"),
+                                          QStringLiteral("kactivitymanagerd"), QStringLiteral("gnome-shell"),    QStringLiteral("tracker-miner-fs-3"),
+                                          QStringLiteral("xdg-desktop-portal"), QStringLiteral("akonadiserver"), QStringLiteral("kdeconnectd"), QStringLiteral("gvfsd")};
+    if (desktopOwn.contains(program)) {
+        return program;
+    }
+    QFile file(QStringLiteral("/proc/%1/cgroup").arg(pid));
+    if (!file.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+    const QString unit = QString::fromUtf8(file.read(4096)).trimmed().section(QLatin1Char('/'), -1);
+    if (!unit.endsWith(QLatin1String(".service")) || (unit.startsWith(QLatin1String("app-")) && !unit.contains(QLatin1String("@autostart")))) {
+        return {};
+    }
+    return unit.left(128);
+}
 }
 
 EventJournal::EventJournal(const NewestTree *tree)
@@ -155,7 +181,8 @@ EventJournal::Who EventJournal::who(int pid, qint64 when)
         if (m_who.size() > 4096) {
             m_who.clear();
         }
-        it = m_who.insert(pid, {programOf(pid), appOf(pid), when});
+        const QString program = programOf(pid);
+        it = m_who.insert(pid, {program, appOf(pid), serviceOf(pid, program), when});
     }
     return *it;
 }
@@ -166,7 +193,10 @@ quint64 EventJournal::operationFor(const Who &by, const QString &path, bool isFo
     // who is at work: an application, whatever its processes; what belongs to none (compilers, shells, tools)
     // together. Each home apart: nothing of one user's shows through another's
     const QString home = m_tree->homeRootOf(path);
-    const QString key = (by.app.isEmpty() ? QStringLiteral("tools:") : QStringLiteral("app:") + by.app + QLatin1Char(':')) + home;
+    // What works on its own apart from what the user does: each service has its operations
+    const QString key = (!by.service.isEmpty() ? QStringLiteral("service:") + by.service + QLatin1Char(':')
+                             : by.app.isEmpty() ? QStringLiteral("tools:") : QStringLiteral("app:") + by.app + QLatin1Char(':'))
+        + home;
     if (m_live.size() > 1024) {
         m_live.clear();
     }
@@ -182,7 +212,7 @@ quint64 EventJournal::operationFor(const Who &by, const QString &path, bool isFo
     }
     Operation &operation = *it;
     operation.last = when;
-    operation.kinds |= kinds & ~quint32(FileEvent::Folder);
+    operation.kinds |= (kinds & ~quint32(FileEvent::Folder)) | (by.service.isEmpty() ? 0 : quint32(FileEvent::Automatic));
     if (operation.program.isEmpty()) {
         operation.program = by.program;
     }
@@ -220,7 +250,8 @@ void EventJournal::put(const QString &path, quint32 kinds, int pid, qint64 when)
     // what is created and then written to within moments is still "created" (a copy, a download, a new document)
     const bool sameBurst = entry.when > 0 && when - entry.when < 60 * 1000;
     const quint32 before = entry.kinds;
-    entry.kinds = (sameBurst ? (before & (FileEvent::Created | FileEvent::Moved)) : 0) | kinds;
+    // (who did the latest thing to it decides whether it was done by hand)
+    entry.kinds = (sameBurst ? (before & (FileEvent::Created | FileEvent::Moved)) : 0) | kinds | (by.service.isEmpty() ? 0 : quint32(FileEvent::Automatic));
     entry.when = when;
     if (operation != 0) {
         entry.operation = operation;
@@ -308,7 +339,7 @@ void EventJournal::rename(const QString &oldFolder, const QString &oldName, cons
         // the name was free, or the name was only reserved (made and never written to)
         kinds |= FileEvent::Modified;
         const auto reserved = m_entries.constFind(newPath);
-        if ((temp.fresh && temp.becomes == newName) || (reserved != m_entries.cend() && reserved->kinds == FileEvent::Created)) {
+        if ((temp.fresh && temp.becomes == newName) || (reserved != m_entries.cend() && (reserved->kinds & ~quint32(FileEvent::Automatic)) == FileEvent::Created)) {
             kinds |= FileEvent::Created;
             m_entries.remove(newPath); // (put() keeps "created" only for a while: here it is known)
         }
