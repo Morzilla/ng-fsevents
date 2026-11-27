@@ -1,0 +1,41 @@
+# CodeRabbit: automatic review of pull requests (https://docs.coderabbit.ai/reference/configuration)
+language: en-US
+tone_instructions: "Plain, direct English. Point at real defects first; skip praise and style nits that do not matter."
+reviews:
+  profile: chill
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+    # (stacked pull requests too: a branch on top of another one is reviewed like one on main)
+    base_branches:
+      - ".*"
+  path_filters:
+    - "!LICENSES/**"
+    - "!build*/**"
+    - "!**/*.png"
+  path_instructions:
+    - path: "src/**"
+      instructions: |
+        ng-fseventsd is a small root service (Qt 6 Core and D-Bus, no KDE): fanotify on whole filesystems, a journal
+        of what changed in the users' homes, answers on the system bus. It runs with CAP_SYS_ADMIN and
+        CAP_DAC_READ_SEARCH, so look first for:
+        - isolation between users: every answer is about the caller's own home only; the caller is the uid the bus
+          reports. Paths are compared as real paths; a home may be a link, and one home may lie inside another.
+        - anything read from a user's home (the exclusion file) is hostile input to a root process: links, devices,
+          size, ownership.
+        - never opening or reading the contents of a user's file; fanotify is used for notifications only.
+        - work per event: the service hears every change on the filesystem, also outside the homes. No path
+          resolution, allocation or /proc read that is not bounded or cached; the event loop must get its turn.
+        - what is kept is bounded (entries, operations, folders) and what is saved can be read back.
+        - merged or lost events (FAN_Q_OVERFLOW, masks OR-ed by the kernel) and files renamed between two events.
+    - path: "data/**"
+      instructions: |
+        The systemd unit and the D-Bus policy of a root service. Check that the sandbox keeps what fanotify needs
+        (the two capabilities, a private mount namespace for the btrfs fallback) and nothing more, and that the
+        policy lets only root own the name.
+    - path: "packaging/**"
+      instructions: |
+        Scripts that install the service outside the package manager, as root. Nothing destructive without being
+        asked; failures must not be reported as success.
