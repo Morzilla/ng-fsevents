@@ -110,7 +110,7 @@ bool EventJournal::isNoise(const QString &name)
 
 bool EventJournal::wanted(const QString &folder, const QString &name) const
 {
-    return !isNoise(name) && m_tree->shown(folder);
+    return !isNoise(name) && m_tree->shown(folder) && !m_tree->excludedName(folder, name);
 }
 
 EventJournal::Who EventJournal::who(int pid, qint64 when)

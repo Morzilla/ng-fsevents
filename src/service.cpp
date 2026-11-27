@@ -28,11 +28,13 @@ const QDBusArgument &operator>>(const QDBusArgument &argument, FileEvent &event)
     return argument;
 }
 
-FsEventsService::FsEventsService(NewestTree *tree, EventJournal *journal, std::function<QString(const QString &)> whyNotWatched, QObject *parent)
+FsEventsService::FsEventsService(NewestTree *tree, EventJournal *journal, std::function<QString(const QString &)> whyNotWatched,
+                                 std::function<QVariantMap()> load, QObject *parent)
     : QObject(parent)
     , m_tree(tree)
     , m_journal(journal)
     , m_whyNotWatched(std::move(whyNotWatched))
+    , m_load(std::move(load))
     , m_started(QDateTime::currentSecsSinceEpoch())
 {
     qDBusRegisterMetaType<FileEvent>();
@@ -90,13 +92,16 @@ QVariantMap FsEventsService::Status()
         return {};
     }
     const QString reason = m_whyNotWatched(m_tree->realHomeOf(uid));
-    return {{QStringLiteral("watched"), reason.isEmpty()},
+    QVariantMap status = m_load();
+    status.insert({{QStringLiteral("watched"), reason.isEmpty()},
             {QStringLiteral("reason"), reason},
             {QStringLiteral("files"), uint(m_journal->count(uid))},
+            {QStringLiteral("exclusions"), uint(m_tree->exclusions(uid))},
             {QStringLiteral("started"), qlonglong(m_started)},
             {QStringLiteral("overflowed"), qlonglong(m_tree->overflowedAt())},
             {QStringLiteral("days"), uint(14)},
-            {QStringLiteral("version"), QStringLiteral("0.2")}};
+            {QStringLiteral("version"), QStringLiteral("0.2")}});
+    return status;
 }
 
 qlonglong FsEventsService::Now()

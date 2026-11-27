@@ -3,6 +3,7 @@
 
 #include <QHash>
 #include <QList>
+#include <QRegularExpression>
 #include <QString>
 #include <QStringList>
 
@@ -18,6 +19,9 @@ public:
         uint uid = 0;
         QString path; // as the account names it, no trailing slash
         QString real; // where it really is (the home may be a link): what the kernel reports
+        // what the user (and the administrator) asked to leave out: see loadExclusions()
+        QList<QRegularExpression> excludedNames;
+        QStringList excludedFolders; // real paths
     };
 
     /** The homes of the human users (uid >= UID_MIN in /etc/login.defs, 1000 if not set). */
@@ -47,6 +51,21 @@ public:
     bool shown(const QString &real, bool withGit = false) const;
     /** @p real as @p uid names it (through the home as the account has it); empty when it is not @p uid's. */
     QString named(uint uid, const QString &real) const;
+
+    /**
+     * Reads what is to be left out for each home: /etc/ng-fsevents/exclude (everyone) and
+     * ~/.config/ng-fsevents/exclude (that user). One entry per line, # for comments:
+     *   *.qcow2        files by name, with * and ? (upper and lower case alike): no entry in the journal of the files
+     *   KVM/           a folder of the home (or an absolute path): nothing in it is recorded, as if it were hidden
+     * The user's file is read as it is (a regular file of that user, at most 64 KiB), never followed as a link.
+     */
+    void loadExclusions();
+    /** Whether a change to @p name in @p real (a folder) is the user's exclusion file: then loadExclusions() is due. */
+    bool isExclusionFile(const QString &real, const QString &name) const;
+    /** Whether the user left files called @p name out (@p real: the folder it is in). */
+    bool excludedName(const QString &real, const QString &name) const;
+    /** How many exclusions @p uid's home has. */
+    int exclusions(uint uid) const;
 
     /** The real path of @p uid's home, or an empty string. */
     QString realHomeOf(uint uid) const;

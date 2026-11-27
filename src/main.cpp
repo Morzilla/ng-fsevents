@@ -60,13 +60,14 @@ int main(int argc, char **argv)
     // --print --home <folder>: that folder is watched as though it were a home (to try a filesystem out)
     if (const int at = app.arguments().indexOf(QStringLiteral("--home")); print && at > 0 && at + 1 < app.arguments().size()) {
         const QString real = QFileInfo(app.arguments().at(at + 1)).canonicalFilePath();
-        homes = {{0, real, real}};
+        homes = {{0, real, real, {}, {}}};
     }
     if (homes.isEmpty()) {
         err << "no user homes found\n";
         return 1;
     }
     NewestTree tree(homes);
+    tree.loadExclusions();
 
     // (systemd gives the service a folder under /run; --print as root by hand gets one of its own)
     QString privateDir = qEnvironmentVariable("RUNTIME_DIRECTORY").section(QLatin1Char(':'), 0, 0);
@@ -139,11 +140,18 @@ int main(int argc, char **argv)
 
     // what happened to each file, and by which program
     EventJournal journal(&tree);
+    qulonglong heard = 0; // every change the kernel told, also the ones dropped at once
     QSet<QString> written; // written to since they were last closed (a file closed unwritten was not modified)
     QObject::connect(&watcher, &FanotifyWatcher::fileEvent, &app,
                      [&](int what, const QString &folder, const QString &name, const QString &oldFolder, const QString &oldName, bool isFolder, int pid) {
         if (pid == QCoreApplication::applicationPid()) {
             return;
+        }
+        // the user changed what is to be left out: read again (a moment later: the editor may still be writing)
+        if (tree.isExclusionFile(folder, name) && (what == FsClosedAfterWriting || what == FsRenamed || what == FsMovedHere || what == FsDeleted)) {
+            QTimer::singleShot(500, &app, [&tree] {
+                tree.loadExclusions();
+            });
         }
         const qint64 now = QDateTime::currentMSecsSinceEpoch();
         const quint32 folderBit = isFolder ? quint32(FileEvent::Folder) : 0;
@@ -186,6 +194,7 @@ int main(int argc, char **argv)
     qint64 printedSecond = 0;
     QSet<QString> printed;
     QObject::connect(&watcher, &FanotifyWatcher::changed, &app, [&](const QString &folder, const QString &name) {
+        ++heard;
         const qint64 now = QDateTime::currentSecsSinceEpoch();
         const bool kept = tree.touch(folder, now);
         if (print && kept) {
@@ -278,6 +287,8 @@ int main(int argc, char **argv)
 
     FsEventsService service(&tree, &journal, [&refused](const QString &home) {
         return home.isEmpty() ? QStringLiteral("no home") : refused.value(home);
+    }, [&] {
+        return QVariantMap{{QStringLiteral("events"), heard}, {QStringLiteral("held"), uint(watcher.heldBack())}};
     });
     QDBusConnection bus = QDBusConnection::systemBus();
     if (!bus.registerObject(QStringLiteral("/org/ng/FsEvents1"), &service, QDBusConnection::ExportAllSlots)

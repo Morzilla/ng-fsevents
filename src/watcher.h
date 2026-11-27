@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 #pragma once
 
+#include <QCache>
 #include <QHash>
 #include <QList>
 #include <QSet>
@@ -53,6 +54,8 @@ public:
     bool watch(const QString &path, QString *error = nullptr, bool mayMount = false);
 
     bool isValid() const;
+    /** How many files have their writes held back at the moment (see the private part). */
+    int heldBack() const;
 
 Q_SIGNALS:
     /** Something called @p name changed in @p directory: modified, attributes changed, created, deleted or moved. */
@@ -78,6 +81,16 @@ private:
     QStringList m_ownMounts; // unmounted at the end
     QSet<quint64> m_viaTop; // subvolumes watched through the top of their filesystem
 
+    void coolDown();
+
+    // A file written to without pause (the disk of a virtual machine, a database, a log) would wake the service
+    // for every write. Past a number of writes in a second the kernel is told to keep that file's writes to
+    // itself for a while (an ignore mark on the file); its closing is still told.
+    QHash<size_t, int> m_writes; // the writes of this second, by file
+    qint64 m_writesSecond = 0;
+    QList<QByteArray> m_ignored; // the files whose writes are not told for now
+    // folder handles turned into paths lately (asked of the kernel once, not for every event)
+    QCache<QByteArray, QString> m_paths{8192};
     quint64 m_mask = 0; // what is asked of each filesystem (decided at the first mark: FAN_RENAME or not)
     int m_fd = -1;
     QSocketNotifier *m_notifier = nullptr;

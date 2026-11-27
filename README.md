@@ -78,6 +78,29 @@ Left out, because nobody looks for them among recent files:
 - a program that changes more than 40 files in a row (a build, an archive unpacked, a synchronisation, a
   checkout): one entry for the folder they have in common, with their number.
 
+### Leaving things out
+
+Hidden folders (`.local`, `.cache`, `.config`...) are never recorded, and neither are the disks of virtual
+machines (`*.qcow2`, `*.vmdk`, `*.vdi`, `*.vhd`, `*.vhdx`). Each user can add to that in
+`~/.config/ng-fsevents/exclude`, and the administrator for everyone in `/etc/ng-fsevents/exclude`; one entry
+per line, read again as soon as the file is saved:
+
+```
+# files by name, with * and ? (upper and lower case alike): no entry in the journal of the files
+*.iso
+backup-*.tar
+# a folder of the home (or an absolute path): nothing in it is recorded, as if it were hidden
+KVM/
+Projects/huge-dataset/
+```
+
+At most 200 entries. The user's file is read only if it is a regular file of that user, at most 64 KiB.
+
+A file written to without pause (the disk of a running virtual machine, a database, a log) does not keep the
+service busy whatever its name: past 20 writes in a second the kernel is told to keep that file's writes to
+itself for a minute. Its closing is still told. Measured with 3 million writes in 8 seconds: 8 s of CPU
+without this, 1 ms with it.
+
 A program that saves by writing a temporary file and renaming it over the document counts as "modified"; as
 "created" too when nothing had that name before. A file written and renamed within an instant may be taken for
 a modified one: the service learns of the temporary file after the rename has happened.
