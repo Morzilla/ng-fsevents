@@ -1,0 +1,110 @@
+# ng-fsevents
+
+**Status: an early version.** It runs as a system service and answers over D-Bus; it was tried on ext4 and on
+a btrfs subvolume (Linux 7.0). No application uses it yet, and the interface may still change.
+
+A small Linux service that keeps a journal of *when something last changed under each folder* of the users'
+homes, at any depth, also while no application is running. It is meant for file managers that sort folders
+by date: a folder should move up when a file deep inside it is edited, which on Linux nothing tells them today.
+
+It started from a discussion about [Dolphin NG](https://github.com/Morzilla/dolphin-ng). Dolphin NG today
+finds the newest change inside a folder while it measures folder sizes, keeps it in a cache, and checks it
+again when the folder is shown. That works, but it is not real time and it goes only as deep as that walk.
+A KDE developer suggested the proper way: fanotify, in a root service, as a library other applications can
+use. This is a sketch of that.
+
+## Why a service, and why root
+
+Linux has two APIs for file changes, and neither does this on its own:
+
+- **inotify** watches one folder at a time, without recursion. Watching a whole home means one watch per folder,
+  with a per-user limit.
+- **fanotify** can watch a whole filesystem with one mark (`FAN_MARK_FILESYSTEM`, Linux 4.20) and, with
+  `FAN_REPORT_DFID_NAME` (Linux 5.9), says in which folder and under which name each change happened. But
+  filesystem marks need `CAP_SYS_ADMIN`: an application cannot ask for them.
+
+Neither keeps a history: what happens while nobody listens is lost. macOS has FSEvents and Windows the NTFS
+change journal for this; Linux has nothing alike for every filesystem.
+
+So the listening has to happen in a small privileged service that runs all the time, and applications ask it.
+
+## How it works
+
+1. At start, it finds the users' homes (accounts from `UID_MIN` up) and puts one fanotify mark on each
+   filesystem that holds one, and on each filesystem mounted inside one (another disk as `~/Documents`, say).
+   The marks are set again whenever the mounts change. Nothing is kept open on a filesystem, so a disk mounted
+   inside a home can still be unmounted.
+2. For each change (modified, attributes, created, deleted, moved) it turns the folder's file handle back into
+   a path. A change outside every home is dropped at once and never kept, and so is one inside a hidden folder
+   (caches, settings, containers): like a file manager, which does not show them. `.git` still counts.
+3. It records the time on that folder and on every folder above it, up to the home.
+4. The table is saved in its state directory every minute and when it stops, so it survives restarts.
+5. Applications ask over D-Bus.
+
+## D-Bus: `org.ng.FsEvents1`
+
+On the system bus, object `/org/ng/FsEvents1`:
+
+| Method | Answer |
+|---|---|
+| `Newest(s folder) → x` | when something last changed under `folder`, in seconds since the epoch (0: nothing seen since the journal began) |
+| `ChangedSince(x since) → as` | the folders of your home that changed at `since` or later, at most 1000. The second asked for is included, so a folder may come again with the next call |
+| `Now() → x` | the service's clock, to call `ChangedSince` from later on |
+
+```sh
+gdbus call --system --dest org.ng.FsEvents1 --object-path /org/ng/FsEvents1 \
+    --method org.ng.FsEvents1.Newest "$HOME/Documents"
+```
+
+## Privacy and safety
+
+The service sees every change on the watched filesystems, so what it gives out is narrow on purpose:
+
+- **Each caller learns about its own home only.** The caller is the uid the bus reports for the connection,
+  which cannot be faked; a folder outside that home is refused. So is a folder of another user's home that
+  lies inside the caller's: a folder belongs to the deepest home that holds it.
+- **No file names are given out**, only folders of the caller's home and dates.
+- **Only homes are kept.** The saved table can be read by root only.
+- **Few privileges.** The systemd unit keeps only `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH`, with no network,
+  a read-only view of the system and the homes, and no new privileges.
+- **Small on purpose**, a few hundred lines, so it can be read in one sitting.
+
+## Filesystems
+
+- **ext4, XFS and the like**: one mark per filesystem.
+- **btrfs**: the kernel refuses a filesystem mark on a subvolume (`EXDEV`), and a home is very often one. The
+  service then mounts the top of that btrfs filesystem read-only in a folder of its own (`/run/ng-fsevents`,
+  inside its private mount namespace: nobody else sees it), marks it there, and gives the paths as they are
+  under the home. Only for the filesystem of a home, since that mount keeps the filesystem busy.
+- **overlayfs** (a live system with persistence, some containers): the mark is refused, and nothing is
+  recorded there. The service says so in its log and answers 0.
+- **Network and FUSE filesystems**: no events from the kernel, nothing recorded.
+
+When the kernel's queue overflows, events are lost: from then on every folder counts as changed at that time,
+also the ones nothing was recorded for.
+
+A home that is a symbolic link is known by both names: ask through either, the answers use the account's.
+
+## Still open
+
+- **Flatpak**: sandboxed applications cannot reach a system service like this; they would need a portal.
+- Notifications pushed to the clients (today they ask), per user, never broadcast.
+- Events per file, and which program made them (see Dolphin NG's recent list): today only folders and dates.
+
+## Try it
+
+```sh
+cmake -B build && cmake --build build
+sudo build/ng-fseventsd --print     # prints every change it sees in the homes; Ctrl+C to stop
+sudo build/ng-fseventsd --print --home /some/folder   # the same for one folder, to try a filesystem out
+```
+
+To install the service, configure with `-DCMAKE_INSTALL_PREFIX=/usr`, then `sudo cmake --install build` and
+`sudo systemctl enable --now ng-fsevents`. The systemd unit and the D-Bus policy go where systemd and the system
+bus read them (`/usr/lib/systemd/system`, `/usr/share/dbus-1/system.d`) whatever the prefix; `SYSTEMD_SYSTEM_UNIT_DIR`
+and `DBUS_SYSTEM_POLICY_DIR` change that.
+
+## Licence
+
+LGPL-2.1-or-later (see `LICENSES/`), so a library built from it can be used by any application. The build and
+configuration files are CC0-1.0.
