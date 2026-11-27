@@ -199,10 +199,11 @@ quint64 EventJournal::operationFor(const Who &by, const QString &path, bool isFo
     if (!live.counted.contains(hash)) {
         live.counted.insert(hash);
         ++operation.count;
-        // past a number of files the rest are counted only: a thousand lines of one unpacking help nobody, and
-        // would push everything else out of the journal
-        *keepEntry = operation.count <= s_operationEntries;
     }
+    // past a number of files the rest are counted only: a thousand lines of one unpacking help nobody, and would
+    // push everything else out of the journal. (Also for the later events of such a file: its closing, say; a
+    // file that has its entry keeps it, see put())
+    *keepEntry = operation.count <= s_operationEntries;
     return live.id;
 }
 
