@@ -27,4 +27,4 @@ systemctl daemon-reload
 systemctl reload dbus-broker 2>/dev/null || systemctl reload dbus 2>/dev/null || true
 systemctl enable --now ng-fsevents
 sleep 1
-systemctl --no-pager --lines=5 status ng-fsevents || true
+systemctl --no-pager --lines=5 status ng-fsevents

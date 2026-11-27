@@ -319,6 +319,10 @@ void NewestTree::expire(qint64 now)
         m_newest.removeIf([oldestKept](const std::pair<const QString &, qint64 &> &entry) {
             return entry.second < oldestKept;
         });
+        // (several as old as the oldest kept: as many of those as it takes go too)
+        for (auto it = m_newest.begin(); it != m_newest.end() && m_newest.size() > most;) {
+            it = it.value() == oldestKept ? m_newest.erase(it) : std::next(it);
+        }
     }
     m_dirty |= m_newest.size() != before;
 }

@@ -23,15 +23,15 @@ Two things come out of it:
   [Dialog NG](https://github.com/Morzilla/dialog-ng) (the picture above).
 
 What it sees, as `ng-fseventsd --print` shows it (a folder made, a file written by a shell, a document saved by
-an editor, a download finished by a browser, a build of 120 files):
+an editor, a download finished by a browser; the number at the end is the operation):
 
 ```
 2026-11-27T17:33:02  /home/ada/Documents  Aurora
-    file: /home/ada/Documents/Aurora  [created,folder]  by mkdir
-    file: /home/ada/Documents/Aurora/notes.txt  [created,modified]  by bash
-    file: /home/ada/Documents/Aurora/report.odt  [modified]  by kwrite (org.kde.kwrite)
-    file: /home/ada/Downloads/manual.pdf  [created,modified]  by firefox (firefox_firefox)
-    file: /home/ada/Projects/app/src  [modified,folder,bulk:120]  by python3
+    file: /home/ada/Documents/Aurora  [created,folder]  by mkdir  #0
+    file: /home/ada/Documents/Aurora/notes.txt  [created,modified]  by bash  #4
+    file: /home/ada/Documents/Aurora/report.odt  [modified]  by kwrite (org.kde.kwrite)  #5
+    file: /home/ada/Downloads/manual.pdf  [created,modified]  by firefox (firefox_firefox)  #6
+    file: /home/ada/Projects/app/src/main.cpp  [modified]  by kwrite (org.kde.kwrite)  #7
 ```
 
 ## Why a service, and why root
@@ -70,7 +70,8 @@ On the system bus, object `/org/ng/FsEvents1`:
 |---|---|
 | `Newest(s folder) → x` | when something last changed under `folder`, in seconds since the epoch (0: nothing seen since the journal began) |
 | `ChangedSince(x since) → as` | the folders of your home that changed at `since` or later, at most 1000. The second asked for is included, so a folder may come again with the next call |
-| `Events(x since, u limit) → a(sxussu)` | the latest that happened to each file and folder of your home, at `since` (**milliseconds**) or later, newest first, at most `limit` (never more than 2000). Each is (path, when in milliseconds, kinds, program, application, count) |
+| `Events(x since, u limit) → a(sxusst)` | the latest that happened to each file and folder of your home, at `since` (**milliseconds**) or later, newest first, at most `limit` (never more than 2000). Each is (path, when in milliseconds, kinds, program, application, operation) |
+| `Operations(x since, u atLeast, u limit) → a(tsxxuuss)` | the things done in one go that ended at `since` or later and changed at least `atLeast` files: (id, the folder their files have in common, first and last moment, how many files, kinds, program, application) |
 | `Status() → a{sv}` | how the service is doing for the caller: `watched` (its home is listened to), `reason` (why not), `files` (entries of the journal of the files), `started`, `overflowed` (when events were last lost), `days`, `version` |
 | `Now() → x` | the service's clock, to call `ChangedSince` from later on |
 
@@ -86,7 +87,14 @@ of the homes, and which program did it: what a list of recent files needs to say
 "downloaded with Firefox" for files no file manager touched. One entry per path, for 14 days, at most 20 000.
 
 `kinds` is a sum of: 1 created, 2 modified (written to, or saved over), 4 renamed or moved to where it is,
-8 it is a folder, 16 a folder that stands for many files (`count` of them) changed at once.
+8 it is a folder.
+
+`operation` ties together the files changed in one go: by one application (or by the tools at work in the home:
+a build is hundreds of short processes), one after the other, each within 10 seconds of the one before. An
+archive unpacked, a synchronisation, a checkout; also two documents saved in a row. `Operations` says how many
+files each one changed and in which folder. What to make of it is the reader's choice: a list of recent files
+shows a few files as they are and many as one line that opens. The first 300 files of an operation have
+entries of their own; the rest are counted.
 
 `program` is the name the process was started with (`firefox`, `gimp-3.0`); `application` is the desktop
 application it belongs to when the session tells (`org.kde.kate`, from the name of its systemd scope; Flatpak
@@ -98,9 +106,7 @@ Left out, because nobody looks for them among recent files:
 - a file opened for writing and closed unwritten, and changes of attributes only (tags, permissions, dates);
 - what is built from something else: object and bytecode files (`.o`, `.pyc`, `.class`...), and what is inside
   the folders build systems fill (`build`, `build-*`, `CMakeFiles`, `node_modules`, `__pycache__`...);
-- more than 40 files changed in a row (a build, an archive unpacked, a synchronisation, a checkout): one entry
-  for the folder they have in common, with their number. Counted by application; the programs that belong to
-  none (compilers, shells, tools) are counted together, since a build is hundreds of short processes.
+- past its first 300 files, the rest of one operation: they are counted, not listed.
 
 ### Leaving things out
 

@@ -167,10 +167,12 @@ int FanotifyWatcher::heldBack() const
 
 void FanotifyWatcher::coolDown()
 {
-    for (const QByteArray &file : std::as_const(m_ignored)) {
-        fanotify_mark(m_fd, FAN_MARK_REMOVE | FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORED_SURV_MODIFY, FAN_MODIFY, AT_FDCWD, file.constData());
+    // every mark on a single file goes at once (the only ones this service puts on files; the marks on the
+    // filesystems stay). Not by name: a file renamed since would keep its mark for ever
+    if (!m_ignored.isEmpty()) {
+        fanotify_mark(m_fd, FAN_MARK_FLUSH, 0, AT_FDCWD, nullptr);
+        m_ignored.clear();
     }
-    m_ignored.clear();
 }
 
 bool FanotifyWatcher::watchBtrfsTop(const QString &path, quint64 key, QString *error)
@@ -281,6 +283,7 @@ void FanotifyWatcher::readEvents()
                 continue;
             }
             if (meta->mask & FAN_Q_OVERFLOW) {
+                m_paths.clear(); // (the rename of a folder may be among what was lost)
                 Q_EMIT overflowed();
                 continue;
             }
@@ -368,6 +371,13 @@ void FanotifyWatcher::readEvents()
             // (one event may carry several kinds, merged by the kernel)
             const bool isFolder = meta->mask & FAN_ONDIR;
             const int pid = meta->pid;
+            // the kernel merges what happens to one name before it is read: made and deleted come as one event
+            // that does not say which was last. Whether the name is there now does
+            const bool both = (meta->mask & FAN_CREATE) && (meta->mask & FAN_DELETE);
+            const bool thereNow = both && ::faccessat(AT_FDCWD, QFile::encodeName(asMarked + QLatin1Char('/') + name).constData(), F_OK, AT_SYMLINK_NOFOLLOW) == 0;
+            if (thereNow) {
+                Q_EMIT fileEvent(FsDeleted, folder, name, {}, {}, isFolder, pid);
+            }
             if (meta->mask & FAN_CREATE) {
                 Q_EMIT fileEvent(FsCreated, folder, name, {}, {}, isFolder, pid);
             }
@@ -389,7 +399,7 @@ void FanotifyWatcher::readEvents()
             if (meta->mask & FAN_ATTRIB) {
                 Q_EMIT fileEvent(FsAttributes, folder, name, {}, {}, isFolder, pid);
             }
-            if (meta->mask & FAN_DELETE) {
+            if ((meta->mask & FAN_DELETE) && !thereNow) {
                 Q_EMIT fileEvent(FsDeleted, folder, name, {}, {}, isFolder, pid);
             }
         }

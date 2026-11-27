@@ -38,8 +38,13 @@ public Q_SLOTS:
     QStringList ChangedSince(qlonglong since);
     /** The latest that happened to each file and folder of the caller's home, at @p since (milliseconds since the
      *  epoch) or later, newest first, at most @p limit (and never more than 2000). Each is (path, when in
-     *  milliseconds, kinds, program, application, count): see FileEvent. One entry per path. */
+     *  milliseconds, kinds, program, application, operation): see FileEvent. One entry per path. */
     QList<FileEvent> Events(qlonglong since, uint limit);
+    /** The things done in one go in the caller's home that ended at @p since (milliseconds) or later and changed
+     *  at least @p atLeast files, newest first, at most @p limit (never more than 2000). Each is (id, the folder
+     *  its files have in common, first and last moment in milliseconds, how many files, kinds, program,
+     *  application): see FileOperation. The entries of Events say which operation they were part of. */
+    QList<FileOperation> Operations(qlonglong since, uint atLeast, uint limit);
     /**
      * How the service is doing for the caller: "watched" (b: the caller's home is listened to), "reason" (s: why
      * not, in the kernel's words), "files" (u: entries of the journal of the files), "started" (x: since when it

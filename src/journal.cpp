@@ -11,12 +11,36 @@
 
 namespace
 {
-constexpr quint32 s_magic = 0x4e474a31; // "NGJ1"
+constexpr quint32 s_magic = 0x4e474a32; // "NGJ2": the entries, the operations, the next operation's number
 constexpr qint64 s_keepMs = 14LL * 24 * 3600 * 1000;
 constexpr int s_keepCount = 20000;
-// more than this many files by one process, each within the window of the one before: a bulk change
-constexpr int s_bulkFiles = 40;
-constexpr qint64 s_bulkWindowMs = 10 * 1000;
+constexpr int s_keepOperations = 5000;
+// an operation: files changed one after the other, each within this long of the one before
+constexpr qint64 s_operationGapMs = 10 * 1000;
+// the files of one operation that have an entry of their own; the rest are counted
+constexpr quint32 s_operationEntries = 300;
+
+template<typename Hash, typename When>
+void dropOldest(Hash &hash, int most, When when)
+{
+    if (hash.size() <= most) {
+        return;
+    }
+    QList<qint64> times;
+    times.reserve(hash.size());
+    for (auto it = hash.cbegin(); it != hash.cend(); ++it) {
+        times.append(when(it.value()));
+    }
+    std::nth_element(times.begin(), times.begin() + (times.size() - most), times.end());
+    const qint64 oldestKept = times.at(times.size() - most);
+    for (auto it = hash.begin(); it != hash.end();) {
+        it = when(it.value()) < oldestKept ? hash.erase(it) : std::next(it);
+    }
+    // (several as old as the oldest kept: as many of those as it takes go too)
+    for (auto it = hash.begin(); it != hash.end() && hash.size() > most;) {
+        it = when(it.value()) == oldestKept ? hash.erase(it) : std::next(it);
+    }
+}
 
 QString commonFolder(const QString &a, const QString &b)
 {
@@ -109,15 +133,15 @@ bool EventJournal::isNoise(const QString &name)
     return random.match(name).hasMatch();
 }
 
-bool EventJournal::wanted(const QString &folder, const QString &name) const
+bool EventJournal::wanted(const QString &folder, const QString &name, bool isFolder) const
 {
     if (isNoise(name) || !m_tree->shown(folder) || m_tree->excludedName(folder, name)) {
         return false;
     }
-    // the folders build systems fill, at any depth
-    static const QRegularExpression built(QStringLiteral("/(?:build|_build|build-[^/]*|cmake-build-[^/]*|CMakeFiles|[^/]*_autogen|node_modules|__pycache__)(?:/|$)"));
+    // what is inside the folders build systems fill, at any depth (a folder by that name, not a file: "build-notes.txt")
+    static const QRegularExpression built(QStringLiteral("/(?:build|_build|build-[^/]*|cmake-build-[^/]*|CMakeFiles|[^/]*_autogen|node_modules|__pycache__)/"));
     const QString home = m_tree->homeRootOf(folder);
-    return !built.match(QStringView(folder).mid(home.size()).toString() + QLatin1Char('/') + name).hasMatch();
+    return !built.match(QStringView(folder).mid(home.size()).toString() + QLatin1Char('/') + (isFolder ? name + QLatin1Char('/') : QString())).hasMatch();
 }
 
 EventJournal::Who EventJournal::who(int pid, qint64 when)
@@ -136,94 +160,72 @@ EventJournal::Who EventJournal::who(int pid, qint64 when)
     return *it;
 }
 
-QString EventJournal::burstKey(const Who &by, const QString &path) const
+quint64 EventJournal::operationFor(const Who &by, const QString &path, bool isFolder, qint64 when, quint32 kinds, bool *keepEntry)
 {
-    // an application, whatever its processes; what belongs to none (compilers, shells, tools) together, by home
-    return (by.app.isEmpty() ? QStringLiteral("tools:") : QStringLiteral("app:") + by.app + QLatin1Char(':')) + m_tree->homeRootOf(path);
+    *keepEntry = true;
+    // who is at work: an application, whatever its processes; what belongs to none (compilers, shells, tools)
+    // together. Each home apart: nothing of one user's shows through another's
+    const QString home = m_tree->homeRootOf(path);
+    const QString key = (by.app.isEmpty() ? QStringLiteral("tools:") : QStringLiteral("app:") + by.app + QLatin1Char(':')) + home;
+    if (m_live.size() > 1024) {
+        m_live.clear();
+    }
+    Live &live = m_live[key];
+    auto it = m_operations.find(live.id);
+    if (live.id == 0 || it == m_operations.end() || when - it->last > s_operationGapMs) {
+        if (isFolder) {
+            return 0; // (a folder made alone begins nothing; one made while files arrive is part of what is going on)
+        }
+        live.id = m_nextOperation++;
+        live.counted.clear();
+        it = m_operations.insert(live.id, Operation{home, QString(), when, when, 0, 0, by.program, by.app});
+    }
+    Operation &operation = *it;
+    operation.last = when;
+    operation.kinds |= kinds & ~quint32(FileEvent::Folder);
+    if (operation.program.isEmpty()) {
+        operation.program = by.program;
+    }
+    m_dirty = true;
+    if (isFolder) {
+        return live.id;
+    }
+    const QString folder = path.left(path.lastIndexOf(QLatin1Char('/')));
+    operation.folder = operation.count == 0 ? folder : commonFolder(operation.folder, folder);
+    if (live.counted.size() > 500000) {
+        live.counted.clear();
+    }
+    const size_t hash = qHash(path);
+    if (!live.counted.contains(hash)) {
+        live.counted.insert(hash);
+        ++operation.count;
+        // past a number of files the rest are counted only: a thousand lines of one unpacking help nobody, and
+        // would push everything else out of the journal
+        *keepEntry = operation.count <= s_operationEntries;
+    }
+    return live.id;
 }
 
 void EventJournal::put(const QString &path, quint32 kinds, int pid, qint64 when)
 {
     const Who by = who(pid, when);
-
-    // many files in a short time: one entry for the folder they share, not one each
-    const QString key = burstKey(by, path);
-    if (!(kinds & FileEvent::Folder)) {
-        if (m_bursts.size() > 1024) {
-            m_bursts.clear();
-        }
-        Burst &burst = m_bursts[key];
-        if (when - burst.last > s_bulkWindowMs) {
-            burst = Burst{};
-            burst.started = when;
-        }
-        burst.last = when;
-        const QString folder = path.left(path.lastIndexOf(QLatin1Char('/')));
-        if (!burst.bulk) {
-            if (!burst.paths.contains(path)) {
-                burst.paths.append(path);
-            }
-            if (burst.paths.size() > s_bulkFiles) {
-                burst.bulk = true;
-                burst.common = folder;
-                for (const QString &one : std::as_const(burst.paths)) {
-                    m_entries.remove(one);
-                    burst.common = commonFolder(burst.common, one.left(one.lastIndexOf(QLatin1Char('/'))));
-                }
-                for (const QString &one : std::as_const(burst.paths)) {
-                    burst.counted.insert(qHash(one));
-                }
-                burst.paths.clear();
-            }
-        } else {
-            if (burst.counted.size() > 200000) {
-                burst.counted.clear();
-            }
-            burst.counted.insert(qHash(path));
-            const QString common = commonFolder(burst.common, folder);
-            if (common != burst.common) {
-                m_entries.remove(burst.common);
-                burst.common = common;
-            }
-        }
-        if (burst.bulk) {
-            // (things all over the home at once have nothing in common: no entry for the home itself)
-            if (m_tree->shown(burst.common) && burst.common != m_tree->homeRootOf(burst.common)) {
-                burst.count = qMax<quint32>(burst.count, burst.counted.size());
-                if (!m_entries.contains(burst.common)) {
-                    // the folders the same burst made inside it are part of the one entry
-                    const QString prefix = burst.common + QLatin1Char('/');
-                    const qint64 started = burst.started;
-                    m_entries.removeIf([&](const std::pair<const QString &, Entry &> &entry) {
-                        return entry.second.when >= started && (entry.second.kinds & FileEvent::Folder) && entry.first.startsWith(prefix);
-                    });
-                }
-                Entry &entry = m_entries[burst.common];
-                entry.when = when;
-                entry.kinds = FileEvent::Folder | FileEvent::Bulk | FileEvent::Modified;
-                entry.count = burst.count;
-                entry.program = by.program;
-                entry.app = by.app;
-                m_dirty = true;
-            }
-            return;
-        }
+    bool keepEntry = true;
+    const quint64 operation = operationFor(by, path, kinds & FileEvent::Folder, when, kinds, &keepEntry);
+    auto known = m_entries.find(path);
+    if (!keepEntry && known == m_entries.end()) {
+        return;
     }
-
-    if (kinds & FileEvent::Folder) {
-        const auto burst = m_bursts.constFind(key);
-        if (burst != m_bursts.cend() && burst->bulk && when - burst->last <= s_bulkWindowMs && path.startsWith(burst->common + QLatin1Char('/'))) {
-            return; // a folder made by a bulk change inside the folder that stands for it
-        }
-    }
-    Entry &entry = m_entries[path];
+    Entry &entry = known != m_entries.end() ? *known : m_entries[path];
     // what is created and then written to within moments is still "created" (a copy, a download, a new document)
     const bool sameBurst = entry.when > 0 && when - entry.when < 60 * 1000;
-    entry.kinds = (sameBurst ? (entry.kinds & (FileEvent::Created | FileEvent::Moved)) : 0) | kinds;
+    const quint32 before = entry.kinds;
+    entry.kinds = (sameBurst ? (before & (FileEvent::Created | FileEvent::Moved)) : 0) | kinds;
     entry.when = when;
-    entry.count = 0;
+    if (operation != 0) {
+        entry.operation = operation;
+    }
     // (within those moments the one who made it stays: a program that touches it right after did not make it)
-    const bool madeBefore = sameBurst && (entry.kinds & FileEvent::Created) && !(kinds & FileEvent::Created) && !entry.program.isEmpty();
+    const bool madeBefore = sameBurst && (before & FileEvent::Created) && !(kinds & FileEvent::Created) && !entry.program.isEmpty();
     if (!madeBefore && (!by.program.isEmpty() || !sameBurst)) {
         entry.program = by.program;
         entry.app = by.app;
@@ -233,7 +235,7 @@ void EventJournal::put(const QString &path, quint32 kinds, int pid, qint64 when)
 
 void EventJournal::record(const QString &folder, const QString &name, quint32 kinds, int pid, qint64 when)
 {
-    if (wanted(folder, name)) {
+    if (wanted(folder, name, kinds & FileEvent::Folder)) {
         put(folder + QLatin1Char('/') + name, kinds, pid, when);
     }
 }
@@ -242,6 +244,7 @@ void EventJournal::remove(const QString &folder, const QString &name, bool isFol
 {
     const QString path = folder + QLatin1Char('/') + name;
     m_dirty |= m_entries.remove(path) > 0;
+    m_temps.remove(path);
     if (isFolder) {
         const QString prefix = path + QLatin1Char('/');
         m_dirty |= m_entries.removeIf([&prefix](const std::pair<const QString &, Entry &> &entry) {
@@ -273,14 +276,16 @@ void EventJournal::rename(const QString &oldFolder, const QString &oldName, cons
 {
     const QString oldPath = oldFolder + QLatin1Char('/') + oldName;
     const QString newPath = newFolder + QLatin1Char('/') + newName;
+    const bool had = m_entries.contains(oldPath);
     const Entry old = m_entries.take(oldPath);
     const Temp temp = m_temps.take(oldPath);
-    const bool kept = wanted(newFolder, newName);
+    m_dirty |= had; // (also when the new name is one nothing is kept for)
+    const bool kept = wanted(newFolder, newName, isFolder);
     if (isFolder) {
         // what was inside is under the new name now (or out of sight: then it is dropped)
         const QString prefix = oldPath + QLatin1Char('/');
         QHash<QString, Entry> moved;
-        m_entries.removeIf([&](const std::pair<const QString &, Entry &> &entry) {
+        const auto gone = m_entries.removeIf([&](const std::pair<const QString &, Entry &> &entry) {
             if (!entry.first.startsWith(prefix)) {
                 return false;
             }
@@ -289,7 +294,7 @@ void EventJournal::rename(const QString &oldFolder, const QString &oldName, cons
             }
             return true;
         });
-        m_dirty |= !moved.isEmpty();
+        m_dirty |= gone > 0;
         m_entries.insert(moved);
     }
     if (!kept) {
@@ -315,20 +320,57 @@ void EventJournal::rename(const QString &oldFolder, const QString &oldName, cons
     put(newPath, kinds, pid, when);
 }
 
+void EventJournal::prune()
+{
+    const auto gone = m_entries.removeIf([this](const std::pair<const QString &, Entry &> &entry) {
+        const int slash = entry.first.lastIndexOf(QLatin1Char('/'));
+        return !wanted(entry.first.left(slash), entry.first.mid(slash + 1), entry.second.kinds & FileEvent::Folder);
+    });
+    m_dirty |= gone > 0;
+}
+
 QList<FileEvent> EventJournal::events(uint uid, qint64 since, int limit) const
 {
     QList<FileEvent> list;
+    if (limit <= 0) {
+        return list;
+    }
     for (auto it = m_entries.cbegin(); it != m_entries.cend(); ++it) {
         if (it->when < since) {
             continue;
         }
         const QString path = m_tree->named(uid, it.key());
         if (!path.isEmpty()) {
-            list.append({path, it->when, it->kinds, it->program, it->app, it->count});
+            list.append({path, it->when, it->kinds, it->program, it->app, it->operation});
         }
     }
     std::sort(list.begin(), list.end(), [](const FileEvent &a, const FileEvent &b) {
         return a.when > b.when;
+    });
+    if (list.size() > limit) {
+        list.resize(limit);
+    }
+    return list;
+}
+
+QList<FileOperation> EventJournal::operations(uint uid, qint64 since, int atLeast, int limit) const
+{
+    QList<FileOperation> list;
+    const QString home = m_tree->realHomeOf(uid);
+    if (limit <= 0 || home.isEmpty()) {
+        return list;
+    }
+    for (auto it = m_operations.cbegin(); it != m_operations.cend(); ++it) {
+        if (it->last < since || it->home != home || int(it->count) < atLeast) {
+            continue;
+        }
+        const QString folder = m_tree->named(uid, it->folder);
+        if (!folder.isEmpty()) {
+            list.append({it.key(), folder, it->first, it->last, it->count, it->kinds, it->program, it->app});
+        }
+    }
+    std::sort(list.begin(), list.end(), [](const FileOperation &a, const FileOperation &b) {
+        return a.last > b.last;
     });
     if (list.size() > limit) {
         list.resize(limit);
@@ -347,23 +389,21 @@ int EventJournal::count(uint uid) const
 
 void EventJournal::expire(qint64 now)
 {
-    const auto before = m_entries.size();
+    const auto before = m_entries.size() + m_operations.size();
     m_entries.removeIf([now](const std::pair<const QString &, Entry &> &entry) {
         return now - entry.second.when > s_keepMs;
     });
-    if (m_entries.size() > s_keepCount) {
-        QList<qint64> times;
-        times.reserve(m_entries.size());
-        for (const Entry &entry : std::as_const(m_entries)) {
-            times.append(entry.when);
-        }
-        std::nth_element(times.begin(), times.begin() + (times.size() - s_keepCount), times.end());
-        const qint64 oldestKept = times.at(times.size() - s_keepCount);
-        m_entries.removeIf([oldestKept](const std::pair<const QString &, Entry &> &entry) {
-            return entry.second.when < oldestKept;
-        });
-    }
-    m_dirty |= m_entries.size() != before;
+    dropOldest(m_entries, s_keepCount, [](const Entry &entry) {
+        return entry.when;
+    });
+    // an operation of one file says nothing more than its file: only the ones of several are kept past their course
+    m_operations.removeIf([now](const std::pair<const quint64 &, Operation &> &operation) {
+        return now - operation.second.last > s_keepMs || (operation.second.count < 2 && now - operation.second.last > s_operationGapMs);
+    });
+    dropOldest(m_operations, s_keepOperations, [](const Operation &operation) {
+        return operation.last;
+    });
+    m_dirty |= m_entries.size() + m_operations.size() != before;
 }
 
 bool EventJournal::load(const QString &file)
@@ -379,19 +419,39 @@ bool EventJournal::load(const QString &file)
     if (magic != s_magic || count > 10 * s_keepCount) {
         return false;
     }
-    QHash<QString, Entry> loaded;
+    QHash<QString, Entry> entries;
     for (quint32 i = 0; i < count && stream.status() == QDataStream::Ok; ++i) {
         QString path;
         Entry entry;
-        stream >> path >> entry.when >> entry.kinds >> entry.count >> entry.program >> entry.app;
-        if (m_tree->shown(path.left(path.lastIndexOf(QLatin1Char('/'))))) { // (still inside a home)
-            loaded.insert(path, entry);
+        stream >> path >> entry.when >> entry.kinds >> entry.operation >> entry.program >> entry.app;
+        const int slash = path.lastIndexOf(QLatin1Char('/'));
+        // (still inside a home, and not something left out since)
+        if (slash > 0 && wanted(path.left(slash), path.mid(slash + 1), entry.kinds & FileEvent::Folder)) {
+            entries.insert(path, entry);
         }
     }
+    quint32 operationCount = 0;
+    quint64 next = 1;
+    stream >> operationCount;
+    if (operationCount > 10 * s_keepOperations) {
+        return false;
+    }
+    QHash<quint64, Operation> operations;
+    for (quint32 i = 0; i < operationCount && stream.status() == QDataStream::Ok; ++i) {
+        quint64 id = 0;
+        Operation operation;
+        stream >> id >> operation.home >> operation.folder >> operation.first >> operation.last >> operation.count >> operation.kinds >> operation.program >> operation.app;
+        if (m_tree->homeRootOf(operation.folder) == operation.home && !operation.home.isEmpty()) {
+            operations.insert(id, operation);
+        }
+    }
+    stream >> next;
     if (stream.status() != QDataStream::Ok) {
         return false;
     }
-    m_entries = loaded;
+    m_entries = entries;
+    m_operations = operations;
+    m_nextOperation = qMax<quint64>(next, 1);
     return true;
 }
 
@@ -405,8 +465,13 @@ bool EventJournal::save(const QString &file) const
     QDataStream stream(&f);
     stream << s_magic << quint32(m_entries.size());
     for (auto it = m_entries.cbegin(); it != m_entries.cend(); ++it) {
-        stream << it.key() << it->when << it->kinds << it->count << it->program << it->app;
+        stream << it.key() << it->when << it->kinds << it->operation << it->program << it->app;
     }
+    stream << quint32(m_operations.size());
+    for (auto it = m_operations.cbegin(); it != m_operations.cend(); ++it) {
+        stream << it.key() << it->home << it->folder << it->first << it->last << it->count << it->kinds << it->program << it->app;
+    }
+    stream << m_nextOperation;
     if (!f.commit()) {
         return false;
     }

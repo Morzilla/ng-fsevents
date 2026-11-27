@@ -147,10 +147,12 @@ int main(int argc, char **argv)
         if (pid == QCoreApplication::applicationPid()) {
             return;
         }
-        // the user changed what is to be left out: read again (a moment later: the editor may still be writing)
-        if (tree.isExclusionFile(folder, name) && (what == FsClosedAfterWriting || what == FsRenamed || what == FsMovedHere || what == FsDeleted)) {
-            QTimer::singleShot(500, &app, [&tree] {
+        // the user changed what is to be left out (saved, replaced, renamed away, deleted): read again, a moment
+        // later (the editor may still be writing), and drop what the new list covers
+        if ((tree.isExclusionFile(folder, name) || tree.isExclusionFile(oldFolder, oldName)) && what != FsWritten && what != FsAttributes && what != FsCreated) {
+            QTimer::singleShot(500, &app, [&tree, &journal] {
                 tree.loadExclusions();
+                journal.prune();
             });
         }
         const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -175,9 +177,26 @@ int main(int argc, char **argv)
                 journal.record(folder, name, FileEvent::Modified, pid, now);
             }
             break;
-        case FsRenamed:
+        case FsRenamed: {
+            // (written under the old name and not closed yet: the closing will come under the new one)
+            const QString from = oldFolder + QLatin1Char('/') + oldName, to = folder + QLatin1Char('/') + name;
+            if (isFolder) {
+                QStringList inside;
+                for (const QString &path : std::as_const(written)) {
+                    if (path.startsWith(from + QLatin1Char('/'))) {
+                        inside.append(path);
+                    }
+                }
+                for (const QString &path : std::as_const(inside)) {
+                    written.remove(path);
+                    written.insert(to + path.mid(from.size()));
+                }
+            } else if (written.remove(from)) {
+                written.insert(to);
+            }
             journal.rename(oldFolder, oldName, folder, name, isFolder, pid, now);
             break;
+        }
         case FsMovedHere:
             journal.record(folder, name, FileEvent::Moved | folderBit, pid, now);
             break;
@@ -237,7 +256,7 @@ int main(int argc, char **argv)
             for (const NewestTree::Home &home : homes) {
                 if (!asked.contains(home.uid)) {
                     asked.insert(home.uid);
-                    fresh += journal.events(home.uid, shownUntil + 1, 200);
+                    fresh += journal.events(home.uid, shownUntil + 1, 1000000); // (all of them: the next call begins after these)
                 }
             }
             for (auto it = fresh.crbegin(); it != fresh.crend(); ++it) {
@@ -247,10 +266,9 @@ int main(int argc, char **argv)
                 kinds += (it->kinds & FileEvent::Modified) ? QStringLiteral("modified") : QString();
                 kinds += (it->kinds & FileEvent::Moved) ? QStringLiteral("moved") : QString();
                 kinds += (it->kinds & FileEvent::Folder) ? QStringLiteral("folder") : QString();
-                kinds += (it->kinds & FileEvent::Bulk) ? QStringLiteral("bulk:%1").arg(it->count) : QString();
                 kinds.removeAll(QString());
                 out << "    file: " << it->path << "  [" << kinds.join(QLatin1Char(',')) << "]  by " << (it->program.isEmpty() ? QStringLiteral("?") : it->program)
-                    << (it->app.isEmpty() ? QString() : QStringLiteral(" (") + it->app + QLatin1Char(')')) << Qt::endl;
+                    << (it->app.isEmpty() ? QString() : QStringLiteral(" (") + it->app + QLatin1Char(')')) << "  #" << it->operation << Qt::endl;
             }
         });
         shower.start(1000);
@@ -265,23 +283,34 @@ int main(int argc, char **argv)
     journal.load(events);
     journal.expire(QDateTime::currentMSecsSinceEpoch());
     tree.expire(QDateTime::currentSecsSinceEpoch());
+    journal.prune();
     QTimer saver;
     int saves = 0;
+    QDateTime everyoneChanged = QFileInfo(QStringLiteral("/etc/ng-fsevents/exclude")).lastModified();
     QObject::connect(&saver, &QTimer::timeout, &app, [&] {
         if (tree.isDirty()) {
             tree.save(state);
         }
         if (++saves % 60 == 0) { // (hourly)
-            journal.expire(QDateTime::currentMSecsSinceEpoch());
             tree.expire(QDateTime::currentSecsSinceEpoch());
         }
+        // (what is saved is within the bounds: a journal past them would be refused when read again)
+        journal.expire(QDateTime::currentMSecsSinceEpoch());
         if (journal.isDirty()) {
             journal.save(events);
+        }
+        // the administrator's exclusions are not in a home, nobody tells when they change: looked at here
+        const QDateTime changed = QFileInfo(QStringLiteral("/etc/ng-fsevents/exclude")).lastModified();
+        if (changed != everyoneChanged) {
+            everyoneChanged = changed;
+            tree.loadExclusions();
+            journal.prune();
         }
     });
     saver.start(60 * 1000);
     QObject::connect(&app, &QCoreApplication::aboutToQuit, &app, [&] {
         tree.save(state);
+        journal.expire(QDateTime::currentMSecsSinceEpoch());
         journal.save(events);
     });
 
