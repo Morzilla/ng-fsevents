@@ -19,6 +19,9 @@ target_link_libraries(ng-fseventsd PRIVATE Qt6::Core Qt6::DBus)
 target_compile_options(ng-fseventsd PRIVATE -Wall -Wextra)
 
 install(TARGETS ng-fseventsd DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
+# the system bus and systemd read fixed directories, whatever the prefix: a policy under /usr/local is never seen
+set(DBUS_SYSTEM_POLICY_DIR "/usr/share/dbus-1/system.d" CACHE PATH "Where the system bus reads its policies")
+set(SYSTEMD_SYSTEM_UNIT_DIR "/usr/lib/systemd/system" CACHE PATH "Where systemd reads the system units")
 configure_file(data/ng-fsevents.service.in ng-fsevents.service @ONLY)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ng-fsevents.service DESTINATION lib/systemd/system)
-install(FILES data/org.ng.FsEvents1.conf DESTINATION ${CMAKE_INSTALL_DATADIR}/dbus-1/system.d)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ng-fsevents.service DESTINATION ${SYSTEMD_SYSTEM_UNIT_DIR})
+install(FILES data/org.ng.FsEvents1.conf DESTINATION ${DBUS_SYSTEM_POLICY_DIR})

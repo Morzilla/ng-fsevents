@@ -16,7 +16,8 @@ class NewestTree
 public:
     struct Home {
         uint uid = 0;
-        QString path; // no trailing slash
+        QString path; // as the account names it, no trailing slash
+        QString real; // where it really is (the home may be a link): what the kernel reports
     };
 
     /** The homes of the human users (uid >= UID_MIN in /etc/login.defs, 1000 if not set). */
@@ -27,24 +28,31 @@ public:
     /** Something changed in @p folder at @p when (seconds since the epoch). Returns false when it was not kept:
      *  outside every home, or inside a hidden folder (like a file manager, which hides them; .git still counts). */
     bool touch(const QString &folder, qint64 when);
-    /** Everything is to be considered changed (the kernel queue overflowed). */
+    /** Everything is to be considered changed from @p when on (the kernel queue overflowed: events were lost).
+     *  Also the folders nothing was recorded for yet. */
     void touchAll(qint64 when);
 
-    /** The home of @p uid, or an empty string. */
-    QString homeOf(uint uid) const;
-    /** When something last changed under @p folder (0: nothing seen since the journal began). */
-    qint64 newest(const QString &folder) const;
-    /** The folders of @p home that changed after @p since, at most @p limit of them. */
-    QStringList changedSince(const QString &home, qint64 since, int limit) const;
+    /** Whether @p uid has a home here. */
+    bool hasHome(uint uid) const;
+    /** When something last changed under @p folder (0: nothing seen since the journal began). @p folder is named
+     *  as the user names it (through the home as the account has it, or where it really is). @p allowed is false
+     *  when the folder is not @p uid's: outside the home, or in another user's home that lies inside it. */
+    qint64 newest(uint uid, const QString &folder, bool *allowed) const;
+    /** The folders of @p uid's home that changed at @p since or later, at most @p limit of them, named through the
+     *  home as the account has it. Never a folder of another user's home that lies inside it. */
+    QStringList changedSince(uint uid, qint64 since, int limit) const;
 
     bool load(const QString &file);
     bool save(const QString &file) const;
     bool isDirty() const;
 
 private:
-    const Home *homeFor(const QString &folder) const;
+    /** The home @p real (a path as the kernel reports it) belongs to: the deepest one that holds it. */
+    const Home *homeFor(const QString &real) const;
+    const Home *homeOf(uint uid) const;
 
     QList<Home> m_homes;
-    QHash<QString, qint64> m_newest; // absolute folder path -> seconds since the epoch
+    QHash<QString, qint64> m_newest; // real folder path -> seconds since the epoch
+    qint64 m_overflow = 0; // events were lost then: nothing is older than this
     mutable bool m_dirty = false;
 };
