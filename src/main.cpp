@@ -16,6 +16,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QSocketNotifier>
 #include <QSet>
 #include <QTextStream>
@@ -91,7 +92,7 @@ int main(int argc, char **argv)
     }
     // one mark per filesystem: the one of each home, and every one mounted inside a home (another disk as
     // ~/Documents, say). Again whenever the mounts change. Not inside a hidden folder: nothing there is kept
-    QSet<QString> refused;
+    QHash<QString, QString> refused; // the root that could not be marked -> why
     const auto markAll = [&] {
         int watched = 0;
         const QList<MountEntry> table = mountTable();
@@ -109,7 +110,7 @@ int main(int argc, char **argv)
                     ++watched;
                     refused.remove(root);
                 } else if (!refused.contains(root)) {
-                    refused.insert(root); // said once
+                    refused.insert(root, error); // said once
                     err << "cannot watch the filesystem of " << root << ": " << error << Qt::endl;
                 }
             }
@@ -254,14 +255,16 @@ int main(int argc, char **argv)
     tree.load(state);
     journal.load(events);
     journal.expire(QDateTime::currentMSecsSinceEpoch());
+    tree.expire(QDateTime::currentSecsSinceEpoch());
     QTimer saver;
     int saves = 0;
     QObject::connect(&saver, &QTimer::timeout, &app, [&] {
         if (tree.isDirty()) {
             tree.save(state);
         }
-        if (++saves % 60 == 0) {
-            journal.expire(QDateTime::currentMSecsSinceEpoch()); // (hourly)
+        if (++saves % 60 == 0) { // (hourly)
+            journal.expire(QDateTime::currentMSecsSinceEpoch());
+            tree.expire(QDateTime::currentSecsSinceEpoch());
         }
         if (journal.isDirty()) {
             journal.save(events);
@@ -273,7 +276,9 @@ int main(int argc, char **argv)
         journal.save(events);
     });
 
-    FsEventsService service(&tree, &journal);
+    FsEventsService service(&tree, &journal, [&refused](const QString &home) {
+        return home.isEmpty() ? QStringLiteral("no home") : refused.value(home);
+    });
     QDBusConnection bus = QDBusConnection::systemBus();
     if (!bus.registerObject(QStringLiteral("/org/ng/FsEvents1"), &service, QDBusConnection::ExportAllSlots)
         || !bus.registerService(QStringLiteral("org.ng.FsEvents1"))) {

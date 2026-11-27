@@ -321,6 +321,15 @@ QList<FileEvent> EventJournal::events(uint uid, qint64 since, int limit) const
     return list;
 }
 
+int EventJournal::count(uint uid) const
+{
+    int n = 0;
+    for (auto it = m_entries.cbegin(); it != m_entries.cend(); ++it) {
+        n += m_tree->named(uid, it.key()).isEmpty() ? 0 : 1;
+    }
+    return n;
+}
+
 void EventJournal::expire(qint64 now)
 {
     const auto before = m_entries.size();

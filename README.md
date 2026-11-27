@@ -50,6 +50,7 @@ On the system bus, object `/org/ng/FsEvents1`:
 | `Newest(s folder) → x` | when something last changed under `folder`, in seconds since the epoch (0: nothing seen since the journal began) |
 | `ChangedSince(x since) → as` | the folders of your home that changed at `since` or later, at most 1000. The second asked for is included, so a folder may come again with the next call |
 | `Events(x since, u limit) → a(sxussu)` | the latest that happened to each file and folder of your home, at `since` (**milliseconds**) or later, newest first, at most `limit` (never more than 2000). Each is (path, when in milliseconds, kinds, program, application, count) |
+| `Status() → a{sv}` | how the service is doing for the caller: `watched` (its home is listened to), `reason` (why not), `files` (entries of the journal of the files), `started`, `overflowed` (when events were last lost), `days`, `version` |
 | `Now() → x` | the service's clock, to call `ChangedSince` from later on |
 
 ```sh
@@ -109,6 +110,9 @@ The service sees every change on the watched filesystems, so what it gives out i
 - **overlayfs** (a live system with persistence, some containers): the mark is refused, and nothing is
   recorded there. The service says so in its log and answers 0.
 - **Network and FUSE filesystems**: no events from the kernel, nothing recorded.
+
+What is kept is bounded: the journal of the files holds 14 days and at most 20 000 entries; the table of the
+folders drops what nothing happened in for half a year, and the oldest beyond 200 000.
 
 When the kernel's queue overflows, events are lost: from then on every folder counts as changed at that time,
 also the ones nothing was recorded for.

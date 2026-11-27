@@ -8,6 +8,7 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 
+#include <algorithm>
 #include <pwd.h>
 
 namespace
@@ -189,6 +190,36 @@ QStringList NewestTree::changedSince(uint uid, qint64 since, int limit) const
         }
     }
     return folders;
+}
+
+QString NewestTree::realHomeOf(uint uid) const
+{
+    const Home *home = homeOf(uid);
+    return home ? home->real : QString();
+}
+
+qint64 NewestTree::overflowedAt() const
+{
+    return m_overflow;
+}
+
+void NewestTree::expire(qint64 now)
+{
+    constexpr qint64 keep = 180LL * 24 * 3600;
+    constexpr int most = 200000;
+    const auto before = m_newest.size();
+    m_newest.removeIf([now](const std::pair<const QString &, qint64 &> &entry) {
+        return now - entry.second > keep;
+    });
+    if (m_newest.size() > most) {
+        QList<qint64> times = m_newest.values();
+        std::nth_element(times.begin(), times.begin() + (times.size() - most), times.end());
+        const qint64 oldestKept = times.at(times.size() - most);
+        m_newest.removeIf([oldestKept](const std::pair<const QString &, qint64 &> &entry) {
+            return entry.second < oldestKept;
+        });
+    }
+    m_dirty |= m_newest.size() != before;
 }
 
 bool NewestTree::load(const QString &file)

@@ -54,6 +54,8 @@ public:
      *  named through the home as the account has it. */
     QList<FileEvent> events(uint uid, qint64 since, int limit) const;
 
+    /** How many entries @p uid's home has. */
+    int count(uint uid) const;
     /** Drops what is older than the days kept, and the oldest beyond the number kept. */
     void expire(qint64 now);
     bool load(const QString &file);

@@ -48,6 +48,14 @@ public:
     /** @p real as @p uid names it (through the home as the account has it); empty when it is not @p uid's. */
     QString named(uint uid, const QString &real) const;
 
+    /** The real path of @p uid's home, or an empty string. */
+    QString realHomeOf(uint uid) const;
+    /** When events were last lost (0: never). */
+    qint64 overflowedAt() const;
+    /** Drops the folders nothing happened in for half a year, and the oldest beyond 200 000: the table does not
+     *  grow for ever (a folder that is not in it answers 0, "nothing seen"). */
+    void expire(qint64 now);
+
     bool load(const QString &file);
     bool save(const QString &file) const;
     bool isDirty() const;
