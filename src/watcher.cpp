@@ -3,7 +3,9 @@
 
 #include <QDir>
 #include <QFile>
+#include <QDateTime>
 #include <QSocketNotifier>
+#include <QTimer>
 
 #include <cerrno>
 #include <cstring>
@@ -21,8 +23,20 @@ quint64 fsidKey(const __kernel_fsid_t &fsid)
     return (quint64(quint32(fsid.val[0])) << 32) | quint32(fsid.val[1]);
 }
 
-// what changes the date of a folder's contents
-constexpr uint64_t s_mask = FAN_MODIFY | FAN_ATTRIB | FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO | FAN_ONDIR;
+// (kernel headers older than 5.17)
+#ifndef FAN_RENAME
+#define FAN_RENAME 0x10000000
+#endif
+#ifndef FAN_EVENT_INFO_TYPE_OLD_DFID_NAME
+#define FAN_EVENT_INFO_TYPE_OLD_DFID_NAME 10
+#endif
+#ifndef FAN_EVENT_INFO_TYPE_NEW_DFID_NAME
+#define FAN_EVENT_INFO_TYPE_NEW_DFID_NAME 12
+#endif
+
+// what changes the date of a folder's contents, and the closing of a written file (when a program is done with it)
+constexpr uint64_t s_base = FAN_MODIFY | FAN_CLOSE_WRITE | FAN_ATTRIB | FAN_CREATE | FAN_DELETE | FAN_ONDIR;
+constexpr uint64_t s_halves = FAN_MOVED_FROM | FAN_MOVED_TO;
 }
 
 QList<MountEntry> mountTable()
@@ -69,6 +83,11 @@ FanotifyWatcher::FanotifyWatcher(const QString &privateDir, QObject *parent)
     }
     m_notifier = new QSocketNotifier(m_fd, QSocketNotifier::Read, this);
     connect(m_notifier, &QSocketNotifier::activated, this, &FanotifyWatcher::readEvents);
+    // the files held back are listened to again every minute: one that calmed down is told as before, one that
+    // did not is held back again after a few writes (so the date of its folder still moves, a minute at a time)
+    auto *cool = new QTimer(this);
+    connect(cool, &QTimer::timeout, this, &FanotifyWatcher::coolDown);
+    cool->start(60 * 1000);
 }
 
 FanotifyWatcher::~FanotifyWatcher()
@@ -81,6 +100,29 @@ FanotifyWatcher::~FanotifyWatcher()
     if (m_fd >= 0) {
         ::close(m_fd);
     }
+}
+
+namespace
+{
+// FAN_RENAME gives both ends of a rename in one event; a kernel without it refuses the mask (EINVAL)
+int addMark(int fd, quint64 &mask, const char *path)
+{
+    if (mask == 0) {
+        if (fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, s_base | FAN_RENAME, AT_FDCWD, path) == 0) {
+            mask = s_base | FAN_RENAME;
+            return 0;
+        }
+        if (errno != EINVAL) {
+            return -1;
+        }
+        if (fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, s_base | s_halves, AT_FDCWD, path) == 0) {
+            mask = s_base | s_halves;
+            return 0;
+        }
+        return -1;
+    }
+    return fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, mask, AT_FDCWD, path);
+}
 }
 
 bool FanotifyWatcher::isValid() const
@@ -104,7 +146,7 @@ bool FanotifyWatcher::watch(const QString &path, QString *error, bool mayMount)
     if (m_roots.contains(key) || m_viaTop.contains(key)) {
         return true; // that filesystem is already watched
     }
-    if (fanotify_mark(m_fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, s_mask, AT_FDCWD, local.constData()) != 0) {
+    if (addMark(m_fd, m_mask, local.constData()) != 0) {
         // a btrfs subvolume has a filesystem id of its own, and the kernel refuses the mark there (seen on 7.0)
         if (errno == EXDEV && mayMount && !m_privateDir.isEmpty()) {
             return watchBtrfsTop(path, key, error);
@@ -116,6 +158,21 @@ bool FanotifyWatcher::watch(const QString &path, QString *error, bool mayMount)
     }
     m_roots.insert(key, local);
     return true;
+}
+
+int FanotifyWatcher::heldBack() const
+{
+    return m_ignored.size();
+}
+
+void FanotifyWatcher::coolDown()
+{
+    // every mark on a single file goes at once (the only ones this service puts on files; the marks on the
+    // filesystems stay). Not by name: a file renamed since would keep its mark for ever
+    if (!m_ignored.isEmpty()) {
+        fanotify_mark(m_fd, FAN_MARK_FLUSH, 0, AT_FDCWD, nullptr);
+        m_ignored.clear();
+    }
 }
 
 bool FanotifyWatcher::watchBtrfsTop(const QString &path, quint64 key, QString *error)
@@ -162,7 +219,7 @@ bool FanotifyWatcher::watchBtrfsTop(const QString &path, quint64 key, QString *e
     }
     m_ownMounts.append(top);
     struct statfs sfs;
-    if (fanotify_mark(m_fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, s_mask, AT_FDCWD, localTop.constData()) != 0 || ::statfs(localTop.constData(), &sfs) != 0) {
+    if (addMark(m_fd, m_mask, localTop.constData()) != 0 || ::statfs(localTop.constData(), &sfs) != 0) {
         return fail(QString::fromLocal8Bit(std::strerror(errno)));
     }
     __kernel_fsid_t fsid;
@@ -226,10 +283,48 @@ void FanotifyWatcher::readEvents()
                 continue;
             }
             if (meta->mask & FAN_Q_OVERFLOW) {
+                m_paths.clear(); // (the rename of a folder may be among what was lost)
                 Q_EMIT overflowed();
                 continue;
             }
-            // the information records follow the metadata
+            // the information records follow the metadata: the folder (as a file handle) and the name; a rename
+            // has two, the old place and the new one
+            QString folder, name, oldFolder, oldName;
+            QString asMarked; // the folder as this service reaches it (under its own mount, for a btrfs subvolume)
+            size_t fileKey = 0;
+            const auto resolve = [&](const char *record, QString &intoFolder, QString &intoName) {
+                const auto *fid = reinterpret_cast<const fanotify_event_info_fid *>(record);
+                auto *handle = reinterpret_cast<file_handle *>(const_cast<unsigned char *>(fid->handle));
+                const char *entry = reinterpret_cast<const char *>(handle->f_handle + handle->handle_bytes);
+                // (the filesystem and the folder's handle name the folder; with the entry's name, the file)
+                const QByteArray folderKey(reinterpret_cast<const char *>(&fid->fsid), int(sizeof fid->fsid + sizeof(file_handle) + handle->handle_bytes));
+                fileKey = qHash(folderKey) ^ (qHash(QByteArrayView(entry)) * 31);
+                if (const QString *known = m_paths.object(folderKey)) {
+                    asMarked = *known;
+                    intoFolder = translated(asMarked);
+                    intoName = QFile::decodeName(entry);
+                    return;
+                }
+                const int mountFd = rootFd(fsidKey(fid->fsid));
+                if (mountFd < 0) {
+                    return;
+                }
+                // the folder's handle back into a path (the folder may be gone already: ESTALE)
+                const int dirFd = ::open_by_handle_at(mountFd, handle, O_PATH | O_CLOEXEC);
+                if (dirFd < 0) {
+                    return;
+                }
+                char target[4096];
+                const QByteArray link = "/proc/self/fd/" + QByteArray::number(dirFd);
+                const ssize_t n = ::readlink(link.constData(), target, sizeof target - 1);
+                ::close(dirFd);
+                if (n > 0) {
+                    asMarked = QFile::decodeName(QByteArray(target, n));
+                    m_paths.insert(folderKey, new QString(asMarked));
+                    intoFolder = translated(asMarked);
+                    intoName = QFile::decodeName(entry);
+                }
+            };
             const char *record = reinterpret_cast<const char *>(meta) + meta->metadata_len;
             const char *end = reinterpret_cast<const char *>(meta) + meta->event_len;
             while (record + sizeof(fanotify_event_info_header) <= end) {
@@ -237,26 +332,75 @@ void FanotifyWatcher::readEvents()
                 if (header->len == 0) {
                     break;
                 }
-                if (header->info_type == FAN_EVENT_INFO_TYPE_DFID_NAME) {
-                    const auto *fid = reinterpret_cast<const fanotify_event_info_fid *>(record);
-                    auto *handle = reinterpret_cast<file_handle *>(const_cast<unsigned char *>(fid->handle));
-                    const char *name = reinterpret_cast<const char *>(handle->f_handle + handle->handle_bytes);
-                    const int mountFd = rootFd(fsidKey(fid->fsid));
-                    if (mountFd >= 0) {
-                        // the folder's handle back into a path (the folder may be gone already: ESTALE)
-                        const int dirFd = ::open_by_handle_at(mountFd, handle, O_PATH | O_CLOEXEC);
-                        if (dirFd >= 0) {
-                            char target[4096];
-                            const QByteArray link = "/proc/self/fd/" + QByteArray::number(dirFd);
-                            const ssize_t n = ::readlink(link.constData(), target, sizeof target - 1);
-                            ::close(dirFd);
-                            if (n > 0) {
-                                Q_EMIT changed(translated(QFile::decodeName(QByteArray(target, n))), QFile::decodeName(name));
-                            }
-                        }
-                    }
+                if (header->info_type == FAN_EVENT_INFO_TYPE_DFID_NAME || header->info_type == FAN_EVENT_INFO_TYPE_NEW_DFID_NAME) {
+                    resolve(record, folder, name);
+                } else if (header->info_type == FAN_EVENT_INFO_TYPE_OLD_DFID_NAME) {
+                    resolve(record, oldFolder, oldName);
                 }
                 record += header->len;
+            }
+            // a folder renamed, moved or deleted: the paths kept for the handles below it are no longer true
+            if ((meta->mask & FAN_ONDIR) && (meta->mask & (FAN_RENAME | FAN_MOVED_FROM | FAN_MOVED_TO | FAN_DELETE))) {
+                m_paths.clear();
+            }
+            // written to without pause: the kernel keeps this file's writes to itself for a while
+            static const bool hold = !qEnvironmentVariableIsSet("NG_FSEVENTS_NO_HOLD"); // (to measure what it saves)
+            if (hold && (meta->mask & FAN_MODIFY) && !(meta->mask & FAN_ONDIR) && !asMarked.isEmpty() && m_ignored.size() < 256) {
+                const qint64 second = QDateTime::currentSecsSinceEpoch();
+                if (second != m_writesSecond) {
+                    m_writesSecond = second;
+                    m_writes.clear();
+                }
+                if (++m_writes[fileKey] == 20) {
+                    const QByteArray file = QFile::encodeName(asMarked + QLatin1Char('/') + name);
+                    if (fanotify_mark(m_fd, FAN_MARK_ADD | FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORED_SURV_MODIFY, FAN_MODIFY, AT_FDCWD, file.constData()) == 0) {
+                        m_ignored.append(file);
+                    }
+                }
+            }
+            if (!oldFolder.isEmpty()) {
+                Q_EMIT changed(oldFolder, oldName);
+            }
+            if (folder.isEmpty()) {
+                if (meta->mask & FAN_RENAME && !oldFolder.isEmpty()) {
+                    Q_EMIT fileEvent(FsMovedAway, oldFolder, oldName, {}, {}, meta->mask & FAN_ONDIR, meta->pid); // to where it cannot be followed
+                }
+                continue;
+            }
+            Q_EMIT changed(folder, name);
+            // (one event may carry several kinds, merged by the kernel)
+            const bool isFolder = meta->mask & FAN_ONDIR;
+            const int pid = meta->pid;
+            // the kernel merges what happens to one name before it is read: made and deleted come as one event
+            // that does not say which was last. Whether the name is there now does
+            const bool both = (meta->mask & FAN_CREATE) && (meta->mask & FAN_DELETE);
+            const bool thereNow = both && ::faccessat(AT_FDCWD, QFile::encodeName(asMarked + QLatin1Char('/') + name).constData(), F_OK, AT_SYMLINK_NOFOLLOW) == 0;
+            if (thereNow) {
+                Q_EMIT fileEvent(FsDeleted, folder, name, {}, {}, isFolder, pid);
+            }
+            if (meta->mask & FAN_CREATE) {
+                Q_EMIT fileEvent(FsCreated, folder, name, {}, {}, isFolder, pid);
+            }
+            if (meta->mask & FAN_RENAME) {
+                Q_EMIT fileEvent(FsRenamed, folder, name, oldFolder, oldName, isFolder, pid);
+            }
+            if (meta->mask & FAN_MOVED_FROM) {
+                Q_EMIT fileEvent(FsMovedAway, folder, name, {}, {}, isFolder, pid);
+            }
+            if (meta->mask & FAN_MOVED_TO) {
+                Q_EMIT fileEvent(FsMovedHere, folder, name, {}, {}, isFolder, pid);
+            }
+            if (meta->mask & FAN_MODIFY) {
+                Q_EMIT fileEvent(FsWritten, folder, name, {}, {}, isFolder, pid);
+            }
+            if (meta->mask & FAN_CLOSE_WRITE) {
+                Q_EMIT fileEvent(FsClosedAfterWriting, folder, name, {}, {}, isFolder, pid);
+            }
+            if (meta->mask & FAN_ATTRIB) {
+                Q_EMIT fileEvent(FsAttributes, folder, name, {}, {}, isFolder, pid);
+            }
+            if ((meta->mask & FAN_DELETE) && !thereNow) {
+                Q_EMIT fileEvent(FsDeleted, folder, name, {}, {}, isFolder, pid);
             }
         }
     }

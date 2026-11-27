@@ -13,6 +13,27 @@ again when the folder is shown. That works, but it is not real time and it goes 
 A KDE developer suggested the proper way: fanotify, in a root service, as a library other applications can
 use. This is a sketch of that.
 
+![What it is for: a list of recent files that says which program did what (ng-recent, in Dolphin NG)](docs/recent-list.png)
+
+Two things come out of it:
+
+- **when something last changed under each folder**, for file managers that sort folders by date;
+- **the latest thing that happened to each file, and which program did it**, for lists of recent files:
+  [ng-recent](https://github.com/Morzilla/ng-recent) uses it, and through it Dolphin NG and
+  [Dialog NG](https://github.com/Morzilla/dialog-ng) (the picture above).
+
+What it sees, as `ng-fseventsd --print` shows it (a folder made, a file written by a shell, a document saved by
+an editor, a download finished by a browser; the number at the end is the operation):
+
+```
+2026-11-27T17:33:02  /home/ada/Documents  Aurora
+    file: /home/ada/Documents/Aurora  [created,folder]  by mkdir  #0
+    file: /home/ada/Documents/Aurora/notes.txt  [created,modified]  by bash  #4
+    file: /home/ada/Documents/Aurora/report.odt  [modified]  by kwrite (org.kde.kwrite)  #5
+    file: /home/ada/Downloads/manual.pdf  [created,modified]  by firefox (firefox_firefox)  #6
+    file: /home/ada/Projects/app/src/main.cpp  [modified]  by kwrite (org.kde.kwrite)  #7
+```
+
 ## Why a service, and why root
 
 Linux has two APIs for file changes, and neither does this on its own:
@@ -49,12 +70,76 @@ On the system bus, object `/org/ng/FsEvents1`:
 |---|---|
 | `Newest(s folder) → x` | when something last changed under `folder`, in seconds since the epoch (0: nothing seen since the journal began) |
 | `ChangedSince(x since) → as` | the folders of your home that changed at `since` or later, at most 1000. The second asked for is included, so a folder may come again with the next call |
+| `Events(x since, u limit) → a(sxusst)` | the latest that happened to each file and folder of your home, at `since` (**milliseconds**) or later, newest first, at most `limit` (never more than 2000). Each is (path, when in milliseconds, kinds, program, application, operation) |
+| `Operations(x since, u atLeast, u limit) → a(tsxxuuss)` | the things done in one go that ended at `since` or later and changed at least `atLeast` files: (id, the folder their files have in common, first and last moment, how many files, kinds, program, application) |
+| `Status() → a{sv}` | how the service is doing for the caller: `watched` (its home is listened to), `reason` (why not), `files` (entries of the journal of the files), `started`, `overflowed` (when events were last lost), `days`, `version` |
 | `Now() → x` | the service's clock, to call `ChangedSince` from later on |
 
 ```sh
 gdbus call --system --dest org.ng.FsEvents1 --object-path /org/ng/FsEvents1 \
     --method org.ng.FsEvents1.Newest "$HOME/Documents"
 ```
+
+### The journal of the files
+
+Besides the dates of the folders, the service keeps the latest thing that happened to each file and folder
+of the homes, and which program did it: what a list of recent files needs to say "modified by GIMP" or
+"downloaded with Firefox" for files no file manager touched. One entry per path, for 14 days, at most 20 000.
+
+`kinds` is a sum of: 1 created, 2 modified (written to, or saved over), 4 renamed or moved to where it is,
+8 it is a folder, 32 done by something that works on its own.
+
+**By hand or on its own.** A change is "automatic" (32) when the process that made it runs in a systemd service,
+of the system or of the user: a synchronisation, an updater, a timer. An application or a terminal runs in a
+scope (the session's, or one of its own), and so does what is started from them. The desktop's own background
+programs (plasmashell, kded, the file indexer...) share the session with the applications and are known by
+name. Each service has its own operations, apart from what the user does at the same moment.
+
+`operation` ties together the files changed in one go: by one application (or by the tools at work in the home:
+a build is hundreds of short processes), one after the other, each within 10 seconds of the one before. An
+archive unpacked, a synchronisation, a checkout; also two documents saved in a row. `Operations` says how many
+files each one changed and in which folder. What to make of it is the reader's choice: a list of recent files
+shows a few files as they are and many as one line that opens. The first 300 files of an operation have
+entries of their own; the rest are counted.
+
+`program` is the name the process was started with (`firefox`, `gimp-3.0`); `application` is the desktop
+application it belongs to when the session tells (`org.kde.kate`, from the name of its systemd scope; Flatpak
+and Snap applications too). Either may be empty: a process that lives a moment may be gone before it is asked.
+
+Left out, because nobody looks for them among recent files:
+
+- what is hidden or inside a hidden folder, and temporary, lock and partial-download files;
+- a file opened for writing and closed unwritten, and changes of attributes only (tags, permissions, dates);
+- what is built from something else: object and bytecode files (`.o`, `.pyc`, `.class`...), and what is inside
+  the folders build systems fill (`build`, `build-*`, `CMakeFiles`, `node_modules`, `__pycache__`...);
+- past its first 300 files, the rest of one operation: they are counted, not listed.
+
+### Leaving things out
+
+Hidden folders (`.local`, `.cache`, `.config`...) are never recorded, and neither are the disks of virtual
+machines (`*.qcow2`, `*.vmdk`, `*.vdi`, `*.vhd`, `*.vhdx`). Each user can add to that in
+`~/.config/ng-fsevents/exclude`, and the administrator for everyone in `/etc/ng-fsevents/exclude`; one entry
+per line, read again as soon as the file is saved:
+
+```
+# files by name, with * and ? (upper and lower case alike): no entry in the journal of the files
+*.iso
+backup-*.tar
+# a folder of the home (or an absolute path): nothing in it is recorded, as if it were hidden
+KVM/
+Projects/huge-dataset/
+```
+
+At most 200 entries. The user's file is read only if it is a regular file of that user, at most 64 KiB.
+
+A file written to without pause (the disk of a running virtual machine, a database, a log) does not keep the
+service busy whatever its name: past 20 writes in a second the kernel is told to keep that file's writes to
+itself for a minute. Its closing is still told. Measured with 3 million writes in 8 seconds: 8 s of CPU
+without this, 1 ms with it.
+
+A program that saves by writing a temporary file and renaming it over the document counts as "modified"; as
+"created" too when nothing had that name before. A file written and renamed within an instant may be taken for
+a modified one: the service learns of the temporary file after the rename has happened.
 
 ## Privacy and safety
 
@@ -63,8 +148,13 @@ The service sees every change on the watched filesystems, so what it gives out i
 - **Each caller learns about its own home only.** The caller is the uid the bus reports for the connection,
   which cannot be faked; a folder outside that home is refused. So is a folder of another user's home that
   lies inside the caller's: a folder belongs to the deepest home that holds it.
-- **No file names are given out**, only folders of the caller's home and dates.
-- **Only homes are kept.** The saved table can be read by root only.
+- **A caller gets its own files' names and nobody else's**: `Newest` and `ChangedSince` give folders and dates
+  only, `Events` the names of the caller's files and of the programs that changed them.
+- **Never contents.** fanotify is used for notifications only (which entry of which folder, which kind of
+  change, which process): the service never opens a user's file, and does not ask the kernel for the mode
+  that hands files over or lets it allow and deny access.
+- **Only homes are kept.** The saved tables can be read by root only, and the journal of the files forgets
+  what is older than 14 days.
 - **Few privileges.** The systemd unit keeps only `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH`, with no network,
   a read-only view of the system and the homes, and no new privileges.
 - **Small on purpose**, a few hundred lines, so it can be read in one sitting.
@@ -80,6 +170,9 @@ The service sees every change on the watched filesystems, so what it gives out i
   recorded there. The service says so in its log and answers 0.
 - **Network and FUSE filesystems**: no events from the kernel, nothing recorded.
 
+What is kept is bounded: the journal of the files holds 14 days and at most 20 000 entries; the table of the
+folders drops what nothing happened in for half a year, and the oldest beyond 200 000.
+
 When the kernel's queue overflows, events are lost: from then on every folder counts as changed at that time,
 also the ones nothing was recorded for.
 
@@ -89,7 +182,6 @@ A home that is a symbolic link is known by both names: ask through either, the a
 
 - **Flatpak**: sandboxed applications cannot reach a system service like this; they would need a portal.
 - Notifications pushed to the clients (today they ask), per user, never broadcast.
-- Events per file, and which program made them (see Dolphin NG's recent list): today only folders and dates.
 
 ## Try it
 

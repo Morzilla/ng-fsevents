@@ -5,6 +5,7 @@
 //   ng-fseventsd            the service, on the system bus (org.ng.FsEvents1), state in $STATE_DIRECTORY
 //   ng-fseventsd --print    no bus and no state: print every change it sees in the homes (to try it out)
 
+#include "journal.h"
 #include "newesttree.h"
 #include "service.h"
 #include "watcher.h"
@@ -15,6 +16,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QSocketNotifier>
 #include <QSet>
 #include <QTextStream>
@@ -58,13 +60,14 @@ int main(int argc, char **argv)
     // --print --home <folder>: that folder is watched as though it were a home (to try a filesystem out)
     if (const int at = app.arguments().indexOf(QStringLiteral("--home")); print && at > 0 && at + 1 < app.arguments().size()) {
         const QString real = QFileInfo(app.arguments().at(at + 1)).canonicalFilePath();
-        homes = {{0, real, real}};
+        homes = {{0, real, real, {}, {}}};
     }
     if (homes.isEmpty()) {
         err << "no user homes found\n";
         return 1;
     }
     NewestTree tree(homes);
+    tree.loadExclusions();
 
     // (systemd gives the service a folder under /run; --print as root by hand gets one of its own)
     QString privateDir = qEnvironmentVariable("RUNTIME_DIRECTORY").section(QLatin1Char(':'), 0, 0);
@@ -90,7 +93,7 @@ int main(int argc, char **argv)
     }
     // one mark per filesystem: the one of each home, and every one mounted inside a home (another disk as
     // ~/Documents, say). Again whenever the mounts change. Not inside a hidden folder: nothing there is kept
-    QSet<QString> refused;
+    QHash<QString, QString> refused; // the root that could not be marked -> why
     const auto markAll = [&] {
         int watched = 0;
         const QList<MountEntry> table = mountTable();
@@ -108,7 +111,7 @@ int main(int argc, char **argv)
                     ++watched;
                     refused.remove(root);
                 } else if (!refused.contains(root)) {
-                    refused.insert(root); // said once
+                    refused.insert(root, error); // said once
                     err << "cannot watch the filesystem of " << root << ": " << error << Qt::endl;
                 }
             }
@@ -135,10 +138,82 @@ int main(int argc, char **argv)
         });
     }
 
+    // what happened to each file, and by which program
+    EventJournal journal(&tree);
+    qulonglong heard = 0; // every change the kernel told, also the ones dropped at once
+    QSet<QString> written; // written to since they were last closed (a file closed unwritten was not modified)
+    QObject::connect(&watcher, &FanotifyWatcher::fileEvent, &app,
+                     [&](int what, const QString &folder, const QString &name, const QString &oldFolder, const QString &oldName, bool isFolder, int pid) {
+        if (pid == QCoreApplication::applicationPid()) {
+            return;
+        }
+        // the user changed what is to be left out (saved, replaced, renamed away, deleted): read again, a moment
+        // later (the editor may still be writing), and drop what the new list covers
+        if ((tree.isExclusionFile(folder, name) || tree.isExclusionFile(oldFolder, oldName)) && what != FsWritten && what != FsAttributes && what != FsCreated) {
+            QTimer::singleShot(500, &app, [&tree, &journal] {
+                tree.loadExclusions();
+                journal.prune();
+            });
+        }
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        const quint32 folderBit = isFolder ? quint32(FileEvent::Folder) : 0;
+        switch (what) {
+        case FsCreated:
+            if (!isFolder && EventJournal::isNoise(name)) {
+                journal.temporaryMade(folder, name, now);
+            }
+            journal.record(folder, name, FileEvent::Created | folderBit, pid, now);
+            break;
+        case FsWritten:
+            if (!isFolder && !EventJournal::isNoise(name)) {
+                if (written.size() > 20000) {
+                    written.clear();
+                }
+                written.insert(folder + QLatin1Char('/') + name);
+            }
+            break;
+        case FsClosedAfterWriting:
+            if (written.remove(folder + QLatin1Char('/') + name)) {
+                journal.record(folder, name, FileEvent::Modified, pid, now);
+            }
+            break;
+        case FsRenamed: {
+            // (written under the old name and not closed yet: the closing will come under the new one)
+            const QString from = oldFolder + QLatin1Char('/') + oldName, to = folder + QLatin1Char('/') + name;
+            if (isFolder) {
+                QStringList inside;
+                for (const QString &path : std::as_const(written)) {
+                    if (path.startsWith(from + QLatin1Char('/'))) {
+                        inside.append(path);
+                    }
+                }
+                for (const QString &path : std::as_const(inside)) {
+                    written.remove(path);
+                    written.insert(to + path.mid(from.size()));
+                }
+            } else if (written.remove(from)) {
+                written.insert(to);
+            }
+            journal.rename(oldFolder, oldName, folder, name, isFolder, pid, now);
+            break;
+        }
+        case FsMovedHere:
+            journal.record(folder, name, FileEvent::Moved | folderBit, pid, now);
+            break;
+        case FsMovedAway:
+        case FsDeleted:
+            journal.remove(folder, name, isFolder);
+            break;
+        default: // (attributes: tags, permissions, dates; not something that "happened to the file")
+            break;
+        }
+    });
+
     // one write is often several events: --print shows each folder at most once a second
     qint64 printedSecond = 0;
     QSet<QString> printed;
     QObject::connect(&watcher, &FanotifyWatcher::changed, &app, [&](const QString &folder, const QString &name) {
+        ++heard;
         const qint64 now = QDateTime::currentSecsSinceEpoch();
         const bool kept = tree.touch(folder, now);
         if (print && kept) {
@@ -172,24 +247,79 @@ int main(int argc, char **argv)
 
     if (print) {
         out << "watching " << watched << " folder tree(s); Ctrl+C to stop" << Qt::endl;
+        // the journal of the files, as the applications get it: what is new in it, once a second
+        qint64 shownUntil = QDateTime::currentMSecsSinceEpoch();
+        QTimer shower;
+        QObject::connect(&shower, &QTimer::timeout, &app, [&] {
+            QList<FileEvent> fresh;
+            QSet<uint> asked;
+            for (const NewestTree::Home &home : homes) {
+                if (!asked.contains(home.uid)) {
+                    asked.insert(home.uid);
+                    fresh += journal.events(home.uid, shownUntil + 1, 1000000); // (all of them: the next call begins after these)
+                }
+            }
+            for (auto it = fresh.crbegin(); it != fresh.crend(); ++it) {
+                shownUntil = qMax(shownUntil, it->when);
+                QStringList kinds;
+                kinds += (it->kinds & FileEvent::Created) ? QStringLiteral("created") : QString();
+                kinds += (it->kinds & FileEvent::Modified) ? QStringLiteral("modified") : QString();
+                kinds += (it->kinds & FileEvent::Moved) ? QStringLiteral("moved") : QString();
+                kinds += (it->kinds & FileEvent::Folder) ? QStringLiteral("folder") : QString();
+                kinds += (it->kinds & FileEvent::Automatic) ? QStringLiteral("automatic") : QString();
+                kinds.removeAll(QString());
+                out << "    file: " << it->path << "  [" << kinds.join(QLatin1Char(',')) << "]  by " << (it->program.isEmpty() ? QStringLiteral("?") : it->program)
+                    << (it->app.isEmpty() ? QString() : QStringLiteral(" (") + it->app + QLatin1Char(')')) << "  #" << it->operation << Qt::endl;
+            }
+        });
+        shower.start(1000);
         return app.exec();
     }
 
     // the journal survives restarts: systemd gives the service a state directory of its own
-    const QString state = qEnvironmentVariable("STATE_DIRECTORY", QStringLiteral("/var/lib/ng-fsevents")) + QStringLiteral("/newest.db");
+    const QString stateDir = qEnvironmentVariable("STATE_DIRECTORY", QStringLiteral("/var/lib/ng-fsevents")).section(QLatin1Char(':'), 0, 0);
+    const QString state = stateDir + QStringLiteral("/newest.db");
+    const QString events = stateDir + QStringLiteral("/events.db");
     tree.load(state);
+    journal.load(events);
+    journal.expire(QDateTime::currentMSecsSinceEpoch());
+    tree.expire(QDateTime::currentSecsSinceEpoch());
+    journal.prune();
     QTimer saver;
+    int saves = 0;
+    QDateTime everyoneChanged = QFileInfo(QStringLiteral("/etc/ng-fsevents/exclude")).lastModified();
     QObject::connect(&saver, &QTimer::timeout, &app, [&] {
         if (tree.isDirty()) {
             tree.save(state);
+        }
+        if (++saves % 60 == 0) { // (hourly)
+            tree.expire(QDateTime::currentSecsSinceEpoch());
+        }
+        // (what is saved is within the bounds: a journal past them would be refused when read again)
+        journal.expire(QDateTime::currentMSecsSinceEpoch());
+        if (journal.isDirty()) {
+            journal.save(events);
+        }
+        // the administrator's exclusions are not in a home, nobody tells when they change: looked at here
+        const QDateTime changed = QFileInfo(QStringLiteral("/etc/ng-fsevents/exclude")).lastModified();
+        if (changed != everyoneChanged) {
+            everyoneChanged = changed;
+            tree.loadExclusions();
+            journal.prune();
         }
     });
     saver.start(60 * 1000);
     QObject::connect(&app, &QCoreApplication::aboutToQuit, &app, [&] {
         tree.save(state);
+        journal.expire(QDateTime::currentMSecsSinceEpoch());
+        journal.save(events);
     });
 
-    FsEventsService service(&tree);
+    FsEventsService service(&tree, &journal, [&refused](const QString &home) {
+        return home.isEmpty() ? QStringLiteral("no home") : refused.value(home);
+    }, [&] {
+        return QVariantMap{{QStringLiteral("events"), heard}, {QStringLiteral("held"), uint(watcher.heldBack())}};
+    });
     QDBusConnection bus = QDBusConnection::systemBus();
     if (!bus.registerObject(QStringLiteral("/org/ng/FsEvents1"), &service, QDBusConnection::ExportAllSlots)
         || !bus.registerService(QStringLiteral("org.ng.FsEvents1"))) {

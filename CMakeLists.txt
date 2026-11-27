@@ -13,6 +13,7 @@ add_executable(ng-fseventsd
     src/main.cpp
     src/watcher.cpp
     src/newesttree.cpp
+    src/journal.cpp
     src/service.cpp
 )
 target_link_libraries(ng-fseventsd PRIVATE Qt6::Core Qt6::DBus)

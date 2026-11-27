@@ -8,7 +8,11 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 
+#include <algorithm>
+#include <fcntl.h>
 #include <pwd.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace
 {
@@ -50,7 +54,7 @@ QList<NewestTree::Home> NewestTree::userHomes()
         }
         // the kernel reports where a folder really is: a home that is a link is known by both names
         const QString real = QFileInfo(path).canonicalFilePath();
-        homes.append({entry->pw_uid, path, real.isEmpty() ? path : real});
+        homes.append({entry->pw_uid, path, real.isEmpty() ? path : real, {}, {}});
     }
     endpwent();
     return homes;
@@ -87,19 +91,131 @@ bool NewestTree::hasHome(uint uid) const
     return homeOf(uid) != nullptr;
 }
 
-bool NewestTree::touch(const QString &folder, qint64 when)
+namespace
 {
-    const Home *home = homeFor(folder);
-    if (!home) {
-        return false; // not in a user's home: not kept
+QByteArray readExclusions(const QString &file, bool ownedBy, uint uid)
+{
+    // (never a link, a device or a pipe; the user's own file is the user's)
+    const int fd = ::open(QFile::encodeName(file).constData(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        return {};
     }
-    // inside a hidden folder (caches, settings, containers...): what a file manager does not show does not count
-    const QStringView inside = QStringView(folder).mid(home->real.size());
+    QByteArray text;
+    struct stat info;
+    if (::fstat(fd, &info) == 0 && S_ISREG(info.st_mode) && info.st_size <= 64 * 1024 && (!ownedBy || info.st_uid == uid)) {
+        text.resize(info.st_size);
+        const ssize_t n = ::read(fd, text.data(), text.size());
+        text.truncate(qMax<ssize_t>(0, n));
+    }
+    ::close(fd);
+    return text;
+}
+}
+
+void NewestTree::loadExclusions()
+{
+    const QByteArray everyone = readExclusions(QStringLiteral("/etc/ng-fsevents/exclude"), false, 0);
+    for (Home &home : m_homes) {
+        home.excludedNames.clear();
+        home.excludedFolders.clear();
+        const QByteArray own = readExclusions(home.real + QStringLiteral("/.config/ng-fsevents/exclude"), true, home.uid);
+        // (left out for everyone: the disks of virtual machines, written to all the time and never "a recent file")
+        static const QByteArray always("*.qcow2\n*.qcow\n*.vmdk\n*.vdi\n*.vhd\n*.vhdx\n");
+        const QStringList lines = QString::fromUtf8(always + everyone + '\n' + own).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        for (QString line : lines) {
+            line = line.trimmed();
+            if (line.isEmpty() || line.startsWith(QLatin1Char('#')) || line.size() > 1024 || home.excludedNames.size() + home.excludedFolders.size() >= 206) {
+                continue;
+            }
+            if (line.contains(QLatin1Char('/'))) {
+                // a folder: of the home, unless the path is absolute ("~/" is the home too)
+                if (line.startsWith(QLatin1String("~/"))) {
+                    line.remove(0, 2);
+                }
+                QString folder = QDir::cleanPath(line.startsWith(QLatin1Char('/')) ? line : home.real + QLatin1Char('/') + line);
+                if (home.path != home.real && isUnder(folder, home.path)) {
+                    folder = home.real + folder.mid(home.path.size());
+                }
+                if (isUnder(folder, home.real) && folder != home.real) {
+                    home.excludedFolders.append(folder);
+                }
+            } else {
+                const QRegularExpression pattern = QRegularExpression::fromWildcard(line, Qt::CaseInsensitive);
+                if (pattern.isValid()) {
+                    home.excludedNames.append(pattern);
+                }
+            }
+        }
+    }
+}
+
+bool NewestTree::isExclusionFile(const QString &real, const QString &name) const
+{
+    if (name != QLatin1String("exclude") || !real.endsWith(QLatin1String("/.config/ng-fsevents"))) {
+        return false;
+    }
+    const Home *home = homeFor(real);
+    return home && real == home->real + QLatin1String("/.config/ng-fsevents");
+}
+
+bool NewestTree::excludedName(const QString &real, const QString &name) const
+{
+    const Home *home = homeFor(real);
+    if (!home) {
+        return false;
+    }
+    for (const QRegularExpression &pattern : home->excludedNames) {
+        if (pattern.match(name).hasMatch()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int NewestTree::exclusions(uint uid) const
+{
+    const Home *home = homeOf(uid);
+    return home ? home->excludedNames.size() + home->excludedFolders.size() : 0;
+}
+
+bool NewestTree::shown(const QString &real, bool withGit) const
+{
+    const Home *home = homeFor(real);
+    if (!home) {
+        return false;
+    }
+    for (const QString &folder : home->excludedFolders) {
+        if (isUnder(real, folder)) {
+            return false; // left out by the user
+        }
+    }
+    const QStringView inside = QStringView(real).mid(home->real.size());
     for (const QStringView part : inside.split(QLatin1Char('/'), Qt::SkipEmptyParts)) {
-        if (part.startsWith(QLatin1Char('.')) && part != QLatin1String(".git")) {
+        if (part.startsWith(QLatin1Char('.')) && !(withGit && part == QLatin1String(".git"))) {
             return false;
         }
     }
+    return true;
+}
+
+QString NewestTree::named(uint uid, const QString &real) const
+{
+    const Home *own = homeOf(uid);
+    const Home *owner = homeFor(real);
+    if (!own || !owner || owner->real != own->real) {
+        return {};
+    }
+    return own->path + real.mid(own->real.size());
+}
+
+bool NewestTree::touch(const QString &folder, qint64 when)
+{
+    // not in a user's home: not kept. Inside a hidden folder (caches, settings, containers...): what a file
+    // manager does not show does not count
+    if (!shown(folder, true)) {
+        return false;
+    }
+    const Home *home = homeFor(folder);
     QString current = folder;
     for (;;) {
         qint64 &value = m_newest[current];
@@ -169,6 +285,46 @@ QStringList NewestTree::changedSince(uint uid, qint64 since, int limit) const
         }
     }
     return folders;
+}
+
+QString NewestTree::homeRootOf(const QString &real) const
+{
+    const Home *home = homeFor(real);
+    return home ? home->real : QString();
+}
+
+QString NewestTree::realHomeOf(uint uid) const
+{
+    const Home *home = homeOf(uid);
+    return home ? home->real : QString();
+}
+
+qint64 NewestTree::overflowedAt() const
+{
+    return m_overflow;
+}
+
+void NewestTree::expire(qint64 now)
+{
+    constexpr qint64 keep = 180LL * 24 * 3600;
+    constexpr int most = 200000;
+    const auto before = m_newest.size();
+    m_newest.removeIf([now](const std::pair<const QString &, qint64 &> &entry) {
+        return now - entry.second > keep;
+    });
+    if (m_newest.size() > most) {
+        QList<qint64> times = m_newest.values();
+        std::nth_element(times.begin(), times.begin() + (times.size() - most), times.end());
+        const qint64 oldestKept = times.at(times.size() - most);
+        m_newest.removeIf([oldestKept](const std::pair<const QString &, qint64 &> &entry) {
+            return entry.second < oldestKept;
+        });
+        // (several as old as the oldest kept: as many of those as it takes go too)
+        for (auto it = m_newest.begin(); it != m_newest.end() && m_newest.size() > most;) {
+            it = it.value() == oldestKept ? m_newest.erase(it) : std::next(it);
+        }
+    }
+    m_dirty |= m_newest.size() != before;
 }
 
 bool NewestTree::load(const QString &file)
