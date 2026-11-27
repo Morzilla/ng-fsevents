@@ -2,7 +2,9 @@
 #include "newesttree.h"
 
 #include <QDataStream>
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QRegularExpression>
 #include <QSaveFile>
 
@@ -30,7 +32,7 @@ bool isUnder(const QString &path, const QString &root)
     return path == root || (path.startsWith(root) && path.at(root.size()) == QLatin1Char('/'));
 }
 
-constexpr quint32 s_magic = 0x4e474645; // "NGFE"
+constexpr quint32 s_magic = 0x4e474632; // "NGF2": the map of the folders, then when events were last lost
 }
 
 QList<NewestTree::Home> NewestTree::userHomes()
@@ -46,7 +48,9 @@ QList<NewestTree::Home> NewestTree::userHomes()
         while (path.size() > 1 && path.endsWith(QLatin1Char('/'))) {
             path.chop(1);
         }
-        homes.append({entry->pw_uid, path});
+        // the kernel reports where a folder really is: a home that is a link is known by both names
+        const QString real = QFileInfo(path).canonicalFilePath();
+        homes.append({entry->pw_uid, path, real.isEmpty() ? path : real});
     }
     endpwent();
     return homes;
@@ -57,25 +61,30 @@ NewestTree::NewestTree(const QList<Home> &homes)
 {
 }
 
-const NewestTree::Home *NewestTree::homeFor(const QString &folder) const
+const NewestTree::Home *NewestTree::homeFor(const QString &real) const
 {
     const Home *best = nullptr;
     for (const Home &home : m_homes) {
-        if (isUnder(folder, home.path) && (!best || home.path.size() > best->path.size())) {
+        if (isUnder(real, home.real) && (!best || home.real.size() > best->real.size())) {
             best = &home;
         }
     }
     return best;
 }
 
-QString NewestTree::homeOf(uint uid) const
+const NewestTree::Home *NewestTree::homeOf(uint uid) const
 {
     for (const Home &home : m_homes) {
         if (home.uid == uid) {
-            return home.path;
+            return &home;
         }
     }
-    return {};
+    return nullptr;
+}
+
+bool NewestTree::hasHome(uint uid) const
+{
+    return homeOf(uid) != nullptr;
 }
 
 bool NewestTree::touch(const QString &folder, qint64 when)
@@ -85,7 +94,7 @@ bool NewestTree::touch(const QString &folder, qint64 when)
         return false; // not in a user's home: not kept
     }
     // inside a hidden folder (caches, settings, containers...): what a file manager does not show does not count
-    const QStringView inside = QStringView(folder).mid(home->path.size());
+    const QStringView inside = QStringView(folder).mid(home->real.size());
     for (const QStringView part : inside.split(QLatin1Char('/'), Qt::SkipEmptyParts)) {
         if (part.startsWith(QLatin1Char('.')) && part != QLatin1String(".git")) {
             return false;
@@ -99,7 +108,7 @@ bool NewestTree::touch(const QString &folder, qint64 when)
         }
         value = when;
         m_dirty = true;
-        if (current == home->path) {
+        if (current == home->real) {
             break;
         }
         current = current.left(current.lastIndexOf(QLatin1Char('/')));
@@ -112,26 +121,51 @@ bool NewestTree::touch(const QString &folder, qint64 when)
 
 void NewestTree::touchAll(qint64 when)
 {
-    for (auto it = m_newest.begin(); it != m_newest.end(); ++it) {
-        it.value() = when;
+    // what was lost may be about any folder, also one nothing is recorded for: one date that every answer is
+    // held against, not a date on each entry
+    if (when > m_overflow) {
+        m_overflow = when;
+        m_dirty = true;
     }
-    for (const Home &home : std::as_const(m_homes)) {
-        m_newest[home.path] = when;
-    }
-    m_dirty = true;
 }
 
-qint64 NewestTree::newest(const QString &folder) const
+qint64 NewestTree::newest(uint uid, const QString &folder, bool *allowed) const
 {
-    return m_newest.value(folder, 0);
+    *allowed = false;
+    const Home *own = homeOf(uid);
+    if (!own) {
+        return 0;
+    }
+    QString real = QDir::cleanPath(folder);
+    if (own->path != own->real && isUnder(real, own->path)) {
+        real = own->real + real.mid(own->path.size()); // asked through the home's link
+    }
+    // the deepest home that holds it must be the caller's: another user's home may lie inside this one
+    const Home *owner = homeFor(real);
+    if (!owner || owner->real != own->real) {
+        return 0;
+    }
+    *allowed = true;
+    return qMax(m_newest.value(real, 0), m_overflow);
 }
 
-QStringList NewestTree::changedSince(const QString &home, qint64 since, int limit) const
+QStringList NewestTree::changedSince(uint uid, qint64 since, int limit) const
 {
     QStringList folders;
+    const Home *own = homeOf(uid);
+    if (!own) {
+        return folders;
+    }
+    if (m_overflow >= since) {
+        return {own->path}; // events were lost since then: the whole home counts as changed
+    }
     for (auto it = m_newest.cbegin(); it != m_newest.cend() && folders.size() < limit; ++it) {
-        if (it.value() > since && isUnder(it.key(), home)) {
-            folders.append(it.key());
+        if (it.value() < since) {
+            continue;
+        }
+        const Home *owner = homeFor(it.key());
+        if (owner && owner->real == own->real) {
+            folders.append(own->path + it.key().mid(own->real.size()));
         }
     }
     return folders;
@@ -150,7 +184,8 @@ bool NewestTree::load(const QString &file)
         return false;
     }
     QHash<QString, qint64> loaded;
-    stream >> loaded;
+    qint64 overflow = 0;
+    stream >> loaded >> overflow;
     if (stream.status() != QDataStream::Ok) {
         return false;
     }
@@ -160,6 +195,7 @@ bool NewestTree::load(const QString &file)
             m_newest.insert(it.key(), it.value());
         }
     }
+    m_overflow = overflow;
     return true;
 }
 
@@ -171,7 +207,7 @@ bool NewestTree::save(const QString &file) const
     }
     f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner); // root only: it lists folder names
     QDataStream stream(&f);
-    stream << s_magic << m_newest;
+    stream << s_magic << m_newest << m_overflow;
     if (!f.commit()) {
         return false;
     }

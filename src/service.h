@@ -23,13 +23,15 @@ public:
 public Q_SLOTS:
     /** When something last changed under @p folder, in seconds since the epoch (0: nothing seen yet). */
     qlonglong Newest(const QString &folder);
-    /** The folders of the caller's home that changed after @p since (seconds since the epoch), at most 1000. */
+    /** The folders of the caller's home that changed at @p since or later (seconds since the epoch), at most 1000.
+     *  The second asked for is included, so nothing that happens later in it is missed: a folder may be given
+     *  again by the next call. */
     QStringList ChangedSince(qlonglong since);
     /** The daemon's clock, to ask ChangedSince() from later on. */
     qlonglong Now();
 
 private:
-    QString callerHome();
+    bool callerUid(uint *uid);
 
     NewestTree *m_tree;
 };

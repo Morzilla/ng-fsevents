@@ -9,6 +9,9 @@ BusName=org.ng.FsEvents1
 ExecStart=@CMAKE_INSTALL_FULL_LIBEXECDIR@/ng-fseventsd
 StateDirectory=ng-fsevents
 StateDirectoryMode=0700
+# (where the top of a btrfs filesystem is mounted, read-only, for this service alone: see the README)
+RuntimeDirectory=ng-fsevents
+RuntimeDirectoryMode=0700
 
 # runs as root, but with only what fanotify needs: filesystem marks and turning file handles into paths
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH

@@ -5,7 +5,6 @@
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
 #include <QDateTime>
-#include <QDir>
 
 FsEventsService::FsEventsService(NewestTree *tree, QObject *parent)
     : QObject(parent)
@@ -13,37 +12,39 @@ FsEventsService::FsEventsService(NewestTree *tree, QObject *parent)
 {
 }
 
-QString FsEventsService::callerHome()
+bool FsEventsService::callerUid(uint *uid)
 {
-    const auto uid = connection().interface()->serviceUid(message().service());
-    const QString home = uid.isValid() ? m_tree->homeOf(uid.value()) : QString();
-    if (home.isEmpty()) {
+    const auto reply = connection().interface()->serviceUid(message().service());
+    if (!reply.isValid() || !m_tree->hasHome(reply.value())) {
         sendErrorReply(QDBusError::AccessDenied, QStringLiteral("only the users with a home can ask"));
+        return false;
     }
-    return home;
+    *uid = reply.value();
+    return true;
 }
 
 qlonglong FsEventsService::Newest(const QString &folder)
 {
-    const QString home = callerHome();
-    if (home.isEmpty()) {
+    uint uid = 0;
+    if (!callerUid(&uid)) {
         return 0;
     }
-    const QString clean = QDir::cleanPath(folder);
-    if (clean != home && !clean.startsWith(home + QLatin1Char('/'))) {
+    bool allowed = false;
+    const qint64 when = m_tree->newest(uid, folder, &allowed);
+    if (!allowed) {
         sendErrorReply(QDBusError::AccessDenied, QStringLiteral("only folders of your own home"));
         return 0;
     }
-    return m_tree->newest(clean);
+    return when;
 }
 
 QStringList FsEventsService::ChangedSince(qlonglong since)
 {
-    const QString home = callerHome();
-    if (home.isEmpty()) {
+    uint uid = 0;
+    if (!callerUid(&uid)) {
         return {};
     }
-    return m_tree->changedSince(home, since, 1000);
+    return m_tree->changedSince(uid, since, 1000);
 }
 
 qlonglong FsEventsService::Now()
