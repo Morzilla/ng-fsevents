@@ -42,6 +42,12 @@ public:
      *  home as the account has it. Never a folder of another user's home that lies inside it. */
     QStringList changedSince(uint uid, qint64 since, int limit) const;
 
+    /** Whether @p real (a folder as the kernel reports it) is in a home and not inside a hidden folder: what a
+     *  file manager shows. .git counts for the dates of the folders (@p withGit), not as something shown. */
+    bool shown(const QString &real, bool withGit = false) const;
+    /** @p real as @p uid names it (through the home as the account has it); empty when it is not @p uid's. */
+    QString named(uint uid, const QString &real) const;
+
     bool load(const QString &file);
     bool save(const QString &file) const;
     bool isDirty() const;

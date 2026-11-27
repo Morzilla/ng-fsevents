@@ -49,12 +49,37 @@ On the system bus, object `/org/ng/FsEvents1`:
 |---|---|
 | `Newest(s folder) → x` | when something last changed under `folder`, in seconds since the epoch (0: nothing seen since the journal began) |
 | `ChangedSince(x since) → as` | the folders of your home that changed at `since` or later, at most 1000. The second asked for is included, so a folder may come again with the next call |
+| `Events(x since, u limit) → a(sxussu)` | the latest that happened to each file and folder of your home, at `since` (**milliseconds**) or later, newest first, at most `limit` (never more than 2000). Each is (path, when in milliseconds, kinds, program, application, count) |
 | `Now() → x` | the service's clock, to call `ChangedSince` from later on |
 
 ```sh
 gdbus call --system --dest org.ng.FsEvents1 --object-path /org/ng/FsEvents1 \
     --method org.ng.FsEvents1.Newest "$HOME/Documents"
 ```
+
+### The journal of the files
+
+Besides the dates of the folders, the service keeps the latest thing that happened to each file and folder
+of the homes, and which program did it: what a list of recent files needs to say "modified by GIMP" or
+"downloaded with Firefox" for files no file manager touched. One entry per path, for 14 days, at most 20 000.
+
+`kinds` is a sum of: 1 created, 2 modified (written to, or saved over), 4 renamed or moved to where it is,
+8 it is a folder, 16 a folder that stands for many files (`count` of them) changed at once.
+
+`program` is the name the process was started with (`firefox`, `gimp-3.0`); `application` is the desktop
+application it belongs to when the session tells (`org.kde.kate`, from the name of its systemd scope; Flatpak
+and Snap applications too). Either may be empty: a process that lives a moment may be gone before it is asked.
+
+Left out, because nobody looks for them among recent files:
+
+- what is hidden or inside a hidden folder, and temporary, lock and partial-download files;
+- a file opened for writing and closed unwritten, and changes of attributes only (tags, permissions, dates);
+- a program that changes more than 40 files in a row (a build, an archive unpacked, a synchronisation, a
+  checkout): one entry for the folder they have in common, with their number.
+
+A program that saves by writing a temporary file and renaming it over the document counts as "modified"; as
+"created" too when nothing had that name before. A file written and renamed within an instant may be taken for
+a modified one: the service learns of the temporary file after the rename has happened.
 
 ## Privacy and safety
 
@@ -63,8 +88,13 @@ The service sees every change on the watched filesystems, so what it gives out i
 - **Each caller learns about its own home only.** The caller is the uid the bus reports for the connection,
   which cannot be faked; a folder outside that home is refused. So is a folder of another user's home that
   lies inside the caller's: a folder belongs to the deepest home that holds it.
-- **No file names are given out**, only folders of the caller's home and dates.
-- **Only homes are kept.** The saved table can be read by root only.
+- **A caller gets its own files' names and nobody else's**: `Newest` and `ChangedSince` give folders and dates
+  only, `Events` the names of the caller's files and of the programs that changed them.
+- **Never contents.** fanotify is used for notifications only (which entry of which folder, which kind of
+  change, which process): the service never opens a user's file, and does not ask the kernel for the mode
+  that hands files over or lets it allow and deny access.
+- **Only homes are kept.** The saved tables can be read by root only, and the journal of the files forgets
+  what is older than 14 days.
 - **Few privileges.** The systemd unit keeps only `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH`, with no network,
   a read-only view of the system and the homes, and no new privileges.
 - **Small on purpose**, a few hundred lines, so it can be read in one sitting.
@@ -89,7 +119,6 @@ A home that is a symbolic link is known by both names: ask through either, the a
 
 - **Flatpak**: sandboxed applications cannot reach a system service like this; they would need a portal.
 - Notifications pushed to the clients (today they ask), per user, never broadcast.
-- Events per file, and which program made them (see Dolphin NG's recent list): today only folders and dates.
 
 ## Try it
 

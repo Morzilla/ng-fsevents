@@ -9,6 +9,17 @@
 
 class QSocketNotifier;
 
+enum FsWhat {
+    FsCreated,
+    FsWritten, // data was written (many times while a file is being written)
+    FsClosedAfterWriting, // closed by a process that had it open for writing
+    FsAttributes,
+    FsDeleted,
+    FsRenamed, // (kernels with FAN_RENAME, Linux 5.17)
+    FsMovedAway, // (older kernels: the two halves of a rename, apart)
+    FsMovedHere,
+};
+
 /** A line of /proc/self/mountinfo. */
 struct MountEntry {
     QString root; // which folder of the filesystem is mounted ("/" or, on btrfs, the subvolume)
@@ -46,6 +57,10 @@ public:
 Q_SIGNALS:
     /** Something called @p name changed in @p directory: modified, attributes changed, created, deleted or moved. */
     void changed(const QString &directory, const QString &name);
+    /** The same, told apart: @p what is one of the Fs* values. For FsRenamed, @p folder and @p name are the new
+     *  place and @p oldFolder and @p oldName the one before (either pair may be empty when that side could not be
+     *  resolved). @p pid is the process that did it (0 when the kernel does not say). */
+    void fileEvent(int what, const QString &folder, const QString &name, const QString &oldFolder, const QString &oldName, bool isFolder, int pid);
     /** The kernel queue overflowed: events were lost, and every folder should be treated as changed. */
     void overflowed();
 
@@ -63,6 +78,7 @@ private:
     QStringList m_ownMounts; // unmounted at the end
     QSet<quint64> m_viaTop; // subvolumes watched through the top of their filesystem
 
+    quint64 m_mask = 0; // what is asked of each filesystem (decided at the first mark: FAN_RENAME or not)
     int m_fd = -1;
     QSocketNotifier *m_notifier = nullptr;
     QHash<quint64, QByteArray> m_roots; // filesystem id -> a folder on it, opened while events are read to resolve file handles

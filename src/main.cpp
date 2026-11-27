@@ -5,6 +5,7 @@
 //   ng-fseventsd            the service, on the system bus (org.ng.FsEvents1), state in $STATE_DIRECTORY
 //   ng-fseventsd --print    no bus and no state: print every change it sees in the homes (to try it out)
 
+#include "journal.h"
 #include "newesttree.h"
 #include "service.h"
 #include "watcher.h"
@@ -135,6 +136,51 @@ int main(int argc, char **argv)
         });
     }
 
+    // what happened to each file, and by which program
+    EventJournal journal(&tree);
+    QSet<QString> written; // written to since they were last closed (a file closed unwritten was not modified)
+    QObject::connect(&watcher, &FanotifyWatcher::fileEvent, &app,
+                     [&](int what, const QString &folder, const QString &name, const QString &oldFolder, const QString &oldName, bool isFolder, int pid) {
+        if (pid == QCoreApplication::applicationPid()) {
+            return;
+        }
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        const quint32 folderBit = isFolder ? quint32(FileEvent::Folder) : 0;
+        switch (what) {
+        case FsCreated:
+            if (!isFolder && EventJournal::isNoise(name)) {
+                journal.temporaryMade(folder, name, now);
+            }
+            journal.record(folder, name, FileEvent::Created | folderBit, pid, now);
+            break;
+        case FsWritten:
+            if (!isFolder && !EventJournal::isNoise(name)) {
+                if (written.size() > 20000) {
+                    written.clear();
+                }
+                written.insert(folder + QLatin1Char('/') + name);
+            }
+            break;
+        case FsClosedAfterWriting:
+            if (written.remove(folder + QLatin1Char('/') + name)) {
+                journal.record(folder, name, FileEvent::Modified, pid, now);
+            }
+            break;
+        case FsRenamed:
+            journal.rename(oldFolder, oldName, folder, name, isFolder, pid, now);
+            break;
+        case FsMovedHere:
+            journal.record(folder, name, FileEvent::Moved | folderBit, pid, now);
+            break;
+        case FsMovedAway:
+        case FsDeleted:
+            journal.remove(folder, name, isFolder);
+            break;
+        default: // (attributes: tags, permissions, dates; not something that "happened to the file")
+            break;
+        }
+    });
+
     // one write is often several events: --print shows each folder at most once a second
     qint64 printedSecond = 0;
     QSet<QString> printed;
@@ -172,24 +218,62 @@ int main(int argc, char **argv)
 
     if (print) {
         out << "watching " << watched << " folder tree(s); Ctrl+C to stop" << Qt::endl;
+        // the journal of the files, as the applications get it: what is new in it, once a second
+        qint64 shownUntil = QDateTime::currentMSecsSinceEpoch();
+        QTimer shower;
+        QObject::connect(&shower, &QTimer::timeout, &app, [&] {
+            QList<FileEvent> fresh;
+            QSet<uint> asked;
+            for (const NewestTree::Home &home : homes) {
+                if (!asked.contains(home.uid)) {
+                    asked.insert(home.uid);
+                    fresh += journal.events(home.uid, shownUntil + 1, 200);
+                }
+            }
+            for (auto it = fresh.crbegin(); it != fresh.crend(); ++it) {
+                shownUntil = qMax(shownUntil, it->when);
+                QStringList kinds;
+                kinds += (it->kinds & FileEvent::Created) ? QStringLiteral("created") : QString();
+                kinds += (it->kinds & FileEvent::Modified) ? QStringLiteral("modified") : QString();
+                kinds += (it->kinds & FileEvent::Moved) ? QStringLiteral("moved") : QString();
+                kinds += (it->kinds & FileEvent::Folder) ? QStringLiteral("folder") : QString();
+                kinds += (it->kinds & FileEvent::Bulk) ? QStringLiteral("bulk:%1").arg(it->count) : QString();
+                kinds.removeAll(QString());
+                out << "    file: " << it->path << "  [" << kinds.join(QLatin1Char(',')) << "]  by " << (it->program.isEmpty() ? QStringLiteral("?") : it->program)
+                    << (it->app.isEmpty() ? QString() : QStringLiteral(" (") + it->app + QLatin1Char(')')) << Qt::endl;
+            }
+        });
+        shower.start(1000);
         return app.exec();
     }
 
     // the journal survives restarts: systemd gives the service a state directory of its own
-    const QString state = qEnvironmentVariable("STATE_DIRECTORY", QStringLiteral("/var/lib/ng-fsevents")) + QStringLiteral("/newest.db");
+    const QString stateDir = qEnvironmentVariable("STATE_DIRECTORY", QStringLiteral("/var/lib/ng-fsevents")).section(QLatin1Char(':'), 0, 0);
+    const QString state = stateDir + QStringLiteral("/newest.db");
+    const QString events = stateDir + QStringLiteral("/events.db");
     tree.load(state);
+    journal.load(events);
+    journal.expire(QDateTime::currentMSecsSinceEpoch());
     QTimer saver;
+    int saves = 0;
     QObject::connect(&saver, &QTimer::timeout, &app, [&] {
         if (tree.isDirty()) {
             tree.save(state);
+        }
+        if (++saves % 60 == 0) {
+            journal.expire(QDateTime::currentMSecsSinceEpoch()); // (hourly)
+        }
+        if (journal.isDirty()) {
+            journal.save(events);
         }
     });
     saver.start(60 * 1000);
     QObject::connect(&app, &QCoreApplication::aboutToQuit, &app, [&] {
         tree.save(state);
+        journal.save(events);
     });
 
-    FsEventsService service(&tree);
+    FsEventsService service(&tree, &journal);
     QDBusConnection bus = QDBusConnection::systemBus();
     if (!bus.registerObject(QStringLiteral("/org/ng/FsEvents1"), &service, QDBusConnection::ExportAllSlots)
         || !bus.registerService(QStringLiteral("org.ng.FsEvents1"))) {

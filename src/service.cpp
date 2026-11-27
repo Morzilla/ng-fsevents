@@ -3,13 +3,47 @@
 #include "newesttree.h"
 
 #include <QDBusConnection>
+#include <QDBusArgument>
 #include <QDBusConnectionInterface>
+#include <QDBusMetaType>
 #include <QDateTime>
 
-FsEventsService::FsEventsService(NewestTree *tree, QObject *parent)
+Q_DECLARE_METATYPE(FileEvent)
+
+QDBusArgument &operator<<(QDBusArgument &argument, const FileEvent &event)
+{
+    argument.beginStructure();
+    argument << event.path << qlonglong(event.when) << event.kinds << event.program << event.app << event.count;
+    argument.endStructure();
+    return argument;
+}
+
+const QDBusArgument &operator>>(const QDBusArgument &argument, FileEvent &event)
+{
+    qlonglong when = 0;
+    argument.beginStructure();
+    argument >> event.path >> when >> event.kinds >> event.program >> event.app >> event.count;
+    argument.endStructure();
+    event.when = when;
+    return argument;
+}
+
+FsEventsService::FsEventsService(NewestTree *tree, EventJournal *journal, QObject *parent)
     : QObject(parent)
     , m_tree(tree)
+    , m_journal(journal)
 {
+    qDBusRegisterMetaType<FileEvent>();
+    qDBusRegisterMetaType<QList<FileEvent>>();
+}
+
+QList<FileEvent> FsEventsService::Events(qlonglong since, uint limit)
+{
+    uint uid = 0;
+    if (!callerUid(&uid)) {
+        return {};
+    }
+    return m_journal->events(uid, since, int(qBound(1u, limit, 2000u)));
 }
 
 bool FsEventsService::callerUid(uint *uid)

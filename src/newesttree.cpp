@@ -87,19 +87,39 @@ bool NewestTree::hasHome(uint uid) const
     return homeOf(uid) != nullptr;
 }
 
-bool NewestTree::touch(const QString &folder, qint64 when)
+bool NewestTree::shown(const QString &real, bool withGit) const
 {
-    const Home *home = homeFor(folder);
+    const Home *home = homeFor(real);
     if (!home) {
-        return false; // not in a user's home: not kept
+        return false;
     }
-    // inside a hidden folder (caches, settings, containers...): what a file manager does not show does not count
-    const QStringView inside = QStringView(folder).mid(home->real.size());
+    const QStringView inside = QStringView(real).mid(home->real.size());
     for (const QStringView part : inside.split(QLatin1Char('/'), Qt::SkipEmptyParts)) {
-        if (part.startsWith(QLatin1Char('.')) && part != QLatin1String(".git")) {
+        if (part.startsWith(QLatin1Char('.')) && !(withGit && part == QLatin1String(".git"))) {
             return false;
         }
     }
+    return true;
+}
+
+QString NewestTree::named(uint uid, const QString &real) const
+{
+    const Home *own = homeOf(uid);
+    const Home *owner = homeFor(real);
+    if (!own || !owner || owner->real != own->real) {
+        return {};
+    }
+    return own->path + real.mid(own->real.size());
+}
+
+bool NewestTree::touch(const QString &folder, qint64 when)
+{
+    // not in a user's home: not kept. Inside a hidden folder (caches, settings, containers...): what a file
+    // manager does not show does not count
+    if (!shown(folder, true)) {
+        return false;
+    }
+    const Home *home = homeFor(folder);
     QString current = folder;
     for (;;) {
         qint64 &value = m_newest[current];
